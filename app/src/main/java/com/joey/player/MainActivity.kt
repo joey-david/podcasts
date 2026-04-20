@@ -3,12 +3,14 @@ package com.joey.player
 import android.Manifest
 import android.app.Application
 import android.content.ComponentName
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.provider.DocumentsContract
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,6 +21,8 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,7 +55,12 @@ import androidx.compose.material.icons.rounded.PauseCircle
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Repeat
+import androidx.compose.material.icons.rounded.RepeatOn
+import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material.icons.rounded.ShuffleOn
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material3.AlertDialog
@@ -93,14 +102,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
+import android.content.pm.PackageManager
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -114,6 +123,7 @@ import androidx.media3.session.SessionToken
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
+import com.joey.player.data.playerStore
 import com.joey.player.domain.MediaSupport
 import com.joey.player.playback.PlayerService
 import com.joey.player.ui.theme.SlatePlayerTheme
@@ -131,8 +141,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
-private val Context.playerStore: DataStore<Preferences> by preferencesDataStore(name = "slate_player")
-
 object PlayerKeys {
     val amoled = booleanPreferencesKey("amoled")
     val folders = stringPreferencesKey("folders")
@@ -141,6 +149,9 @@ object PlayerKeys {
     val lastPosition = longPreferencesKey("last_position")
     val lastDuration = longPreferencesKey("last_duration")
     val lastIsVideo = booleanPreferencesKey("last_is_video")
+    val playbackSpeed = floatPreferencesKey("playback_speed")
+    val shuffleEnabled = booleanPreferencesKey("shuffle_enabled")
+    val repeatMode = intPreferencesKey("repeat_mode")
 }
 
 data class MediaFolder(
@@ -154,6 +165,7 @@ data class MediaEntry(
     val folderName: String,
     val durationMs: Long,
     val isVideo: Boolean,
+    val mimeType: String? = null,
 )
 
 data class ResumeState(
@@ -174,6 +186,14 @@ data class PlayerState(
     val playbackSpeed: Float = 1f,
     val hasNext: Boolean = false,
     val hasPrevious: Boolean = false,
+    val shuffleEnabled: Boolean = false,
+    val repeatMode: Int = Player.REPEAT_MODE_OFF,
+)
+
+data class PlaybackPrefs(
+    val speed: Float = 1f,
+    val shuffleEnabled: Boolean = false,
+    val repeatMode: Int = Player.REPEAT_MODE_OFF,
 )
 
 data class PlayerUiState(
@@ -255,6 +275,28 @@ class PlayerRepository(
         }
     }
 
+    suspend fun getPlaybackPrefs(): PlaybackPrefs {
+        val prefs = context.playerStore.data.first()
+        val storedRepeatMode = prefs[PlayerKeys.repeatMode] ?: Player.REPEAT_MODE_OFF
+        return PlaybackPrefs(
+            speed = (prefs[PlayerKeys.playbackSpeed] ?: 1f).coerceIn(0.5f, 3f),
+            shuffleEnabled = prefs[PlayerKeys.shuffleEnabled] ?: false,
+            repeatMode = storedRepeatMode.takeIf {
+                it == Player.REPEAT_MODE_OFF ||
+                    it == Player.REPEAT_MODE_ONE ||
+                    it == Player.REPEAT_MODE_ALL
+            } ?: Player.REPEAT_MODE_OFF,
+        )
+    }
+
+    suspend fun savePlaybackPrefs(prefs: PlaybackPrefs) {
+        context.playerStore.edit {
+            it[PlayerKeys.playbackSpeed] = prefs.speed
+            it[PlayerKeys.shuffleEnabled] = prefs.shuffleEnabled
+            it[PlayerKeys.repeatMode] = prefs.repeatMode
+        }
+    }
+
     suspend fun clearResume() {
         context.playerStore.edit { prefs ->
             prefs.remove(PlayerKeys.lastUri)
@@ -267,9 +309,65 @@ class PlayerRepository(
 
     suspend fun scanMedia(folders: List<MediaFolder>): List<MediaEntry> = withContext(Dispatchers.IO) {
         folders.flatMap { folder ->
-            val root = DocumentFile.fromTreeUri(context, Uri.parse(folder.uriString)) ?: return@flatMap emptyList()
-            scanFolder(root, folder.name)
+            scanIndexedMedia(folder) ?: run {
+                val root = DocumentFile.fromTreeUri(context, Uri.parse(folder.uriString)) ?: return@flatMap emptyList()
+                scanFolder(root, folder.name)
+            }
         }.sortedWith(compareBy(MediaEntry::folderName, MediaEntry::title))
+    }
+
+    private fun scanIndexedMedia(folder: MediaFolder): List<MediaEntry>? {
+        val relativePrefix = mediaRelativePath(folder) ?: return null
+        val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.MIME_TYPE,
+            MediaStore.MediaColumns.DURATION,
+            MediaStore.Files.FileColumns.MEDIA_TYPE,
+        )
+        val selection = buildString {
+            append("(")
+            append(MediaStore.Files.FileColumns.MEDIA_TYPE)
+            append("=? OR ")
+            append(MediaStore.Files.FileColumns.MEDIA_TYPE)
+            append("=?) AND ")
+            append(MediaStore.MediaColumns.RELATIVE_PATH)
+            append(" LIKE ?")
+        }
+        val selectionArgs = arrayOf(
+            MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
+            if (relativePrefix.isBlank()) "%" else "$relativePrefix%",
+        )
+        val sortOrder =
+            "${MediaStore.MediaColumns.RELATIVE_PATH} ASC, ${MediaStore.MediaColumns.DISPLAY_NAME} COLLATE NOCASE ASC"
+
+        val results = mutableListOf<MediaEntry>()
+        context.contentResolver.query(uri, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
+            val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+            val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+            val mimeIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+            val durationIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
+            val typeIndex = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE)
+            while (cursor.moveToNext()) {
+                val id = cursor.getLong(idIndex)
+                val displayName = cursor.getString(nameIndex).orEmpty()
+                val mimeType = cursor.getString(mimeIndex)
+                val mediaType = cursor.getInt(typeIndex)
+                val contentUri = ContentUris.withAppendedId(uri, id)
+                results += MediaEntry(
+                    uriString = contentUri.toString(),
+                    title = displayName.substringBeforeLast('.').ifBlank { "Untitled" },
+                    folderName = folder.name,
+                    durationMs = cursor.getLong(durationIndex).coerceAtLeast(0L),
+                    isVideo = mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO ||
+                        mimeType?.startsWith("video/") == true,
+                    mimeType = mimeType,
+                )
+            }
+        }
+        return results
     }
 
     private fun scanFolder(root: DocumentFile, folderName: String): List<MediaEntry> {
@@ -285,12 +383,14 @@ class PlayerRepository(
                         val ext = file.name?.substringAfterLast('.', "")?.lowercase(Locale.US).orEmpty()
                         val isPlayable = MediaSupport.isPlayableExtension(ext)
                         if (isPlayable) {
+                            // In scanFolder() inside PlayerRepository
                             results += MediaEntry(
                                 uriString = file.uri.toString(),
                                 title = file.name?.substringBeforeLast('.') ?: "Untitled",
                                 folderName = folderName,
-                                durationMs = readDuration(file.uri),
+                                durationMs = 0L, // Leave this at 0. ExoPlayer will provide the real duration upon playback.
                                 isVideo = MediaSupport.isVideoUri(file.uri.toString()),
+                                mimeType = file.type,
                             )
                         }
                     }
@@ -300,13 +400,12 @@ class PlayerRepository(
         return results
     }
 
-    private fun readDuration(uri: Uri): Long {
-        return runCatching {
-            MediaMetadataRetriever().use { retriever ->
-                retriever.setDataSource(context, uri)
-                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            }
-        }.getOrDefault(0L)
+    private fun mediaRelativePath(folder: MediaFolder): String? {
+        val uri = Uri.parse(folder.uriString)
+        if (uri.authority != "com.android.externalstorage.documents") return null
+        val treeId = DocumentsContract.getTreeDocumentId(uri)
+        val relative = treeId.substringAfter(':', "").trim('/')
+        return if (relative.isBlank()) "" else "$relative/"
     }
 
     private fun encodeFolder(folder: MediaFolder): String = folder.uriString + separator + folder.name
@@ -319,6 +418,8 @@ class PlayerViewModel(
     private val sessionToken = SessionToken(application, ComponentName(application, PlayerService::class.java))
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var playerListener: Player.Listener? = null
+    private var progressJob: Job? = null
+    private val pendingControllerActions = mutableListOf<(MediaController) -> Unit>()
     private val allMedia = MutableStateFlow<List<MediaEntry>>(emptyList())
     private val folders = MutableStateFlow<List<MediaFolder>>(emptyList())
     private val query = MutableStateFlow("")
@@ -371,7 +472,6 @@ class PlayerViewModel(
 
     init {
         loadFolders()
-        connectController()
     }
 
     fun setQuery(value: String) {
@@ -408,7 +508,9 @@ class PlayerViewModel(
 
     fun playFromVisibleList(entry: MediaEntry) {
         val currentList = uiState.value.media
-        playList(currentList, currentList.indexOfFirst { it.uriString == entry.uriString }, 0L)
+        ensureController { target ->
+            playList(currentList, currentList.indexOfFirst { it.uriString == entry.uriString }, 0L, target)
+        }
     }
 
     fun resumeSaved() {
@@ -416,7 +518,9 @@ class PlayerViewModel(
         val list = uiState.value.media.ifEmpty { allMedia.value }
         val index = list.indexOfFirst { it.uriString == resume.uriString }
         if (index >= 0) {
-            playList(list, index, resume.positionMs)
+            ensureController { target ->
+                playList(list, index, resume.positionMs, target)
+            }
         }
     }
 
@@ -427,15 +531,17 @@ class PlayerViewModel(
     }
 
     fun togglePlayPause() {
-        controller?.let {
-            if (it.isPlaying) it.pause() else it.play()
+        ensureController { target ->
+            if (target.isPlaying) target.pause() else target.play()
             refreshPlayerState()
         }
     }
 
     fun skipNext() {
-        controller?.seekToNext()
-        refreshPlayerState()
+        controller?.let {
+            it.seekToNext()
+            refreshPlayerState()
+        }
     }
 
     fun skipPrevious() {
@@ -450,24 +556,54 @@ class PlayerViewModel(
 
     fun jumpBy(deltaMs: Long) {
         controller?.let {
-            it.seekTo((it.currentPosition + deltaMs).coerceAtLeast(0L))
+            val duration = it.duration.takeIf { length -> length > 0L } ?: Long.MAX_VALUE
+            it.seekTo((it.currentPosition + deltaMs).coerceIn(0L, duration))
             refreshPlayerState()
         }
     }
 
     fun setPlaybackSpeed(speed: Float) {
-        controller?.playbackParameters = PlaybackParameters(speed)
-        refreshPlayerState()
+        ensureController { target ->
+            target.playbackParameters = PlaybackParameters(speed)
+            persistPlaybackPrefs()
+            refreshPlayerState()
+        }
     }
 
-    private fun playList(list: List<MediaEntry>, index: Int, seekMs: Long) {
-        val target = controller ?: return
+    fun toggleShuffle() {
+        ensureController { target ->
+            target.shuffleModeEnabled = !target.shuffleModeEnabled
+            persistPlaybackPrefs()
+            refreshPlayerState()
+        }
+    }
+
+    fun cycleRepeatMode() {
+        ensureController { target ->
+            target.repeatMode = when (target.repeatMode) {
+                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                else -> Player.REPEAT_MODE_OFF
+            }
+            persistPlaybackPrefs()
+            refreshPlayerState()
+        }
+    }
+
+    private fun playList(list: List<MediaEntry>, index: Int, seekMs: Long, target: MediaController) {
         if (index !in list.indices) return
-        val items = list.map { entry ->
+
+        // Create a safe window of items to avoid Binder Transaction limits
+        val startIndex = maxOf(0, index - 20)
+        val endIndex = minOf(list.size, index + 50) // Load 50 items ahead max
+        val window = list.subList(startIndex, endIndex)
+        val windowIndex = index - startIndex
+
+        val items = window.map { entry ->
             MediaItem.Builder()
                 .setMediaId(entry.uriString)
                 .setUri(entry.uriString)
-                .setMimeType(MediaSupport.inferMimeType(entry.uriString))
+                .setMimeType(entry.mimeType ?: MediaSupport.inferMimeType(entry.uriString))
                 .setMediaMetadata(
                     MediaMetadata.Builder()
                         .setTitle(entry.title)
@@ -476,7 +612,8 @@ class PlayerViewModel(
                 )
                 .build()
         }
-        target.setMediaItems(items, index, seekMs)
+        
+        target.setMediaItems(items, windowIndex, seekMs)
         target.prepare()
         target.play()
         refreshPlayerState()
@@ -489,23 +626,51 @@ class PlayerViewModel(
         }
     }
 
+    private fun ensureController(onReady: (MediaController) -> Unit) {
+        controller?.let {
+            onReady(it)
+            return
+        }
+        pendingControllerActions += onReady
+        if (controllerFuture != null) return
+        connectController()
+    }
+
     private fun connectController() {
         controllerFuture = MediaController.Builder(getApplication(), sessionToken).buildAsync().also { future ->
             future.addListener(
                 {
                     val built = runCatching { future.get() }.getOrNull() ?: return@addListener
+                    controllerFuture = null
                     controller = built
                     attachListener(built)
                     refreshPlayerState()
+                    startProgressUpdates()
                     viewModelScope.launch {
-                        while (true) {
-                            refreshPlayerState()
-                            kotlinx.coroutines.delay(500L)
-                        }
+                        applyPlaybackPrefs(built)
                     }
+                    pendingControllerActions.toList().forEach { action ->
+                        action(built)
+                    }
+                    pendingControllerActions.clear()
                 },
                 ContextCompat.getMainExecutor(getApplication()),
             )
+        }
+    }
+
+    private fun startProgressUpdates() {
+        progressJob?.cancel()
+        progressJob = viewModelScope.launch {
+            while (true) {
+                val target = controller
+                if (target != null && (target.isPlaying || target.playbackState == Player.STATE_BUFFERING)) {
+                    refreshPlayerState()
+                    kotlinx.coroutines.delay(500L)
+                } else {
+                    kotlinx.coroutines.delay(1_000L)
+                }
+            }
         }
     }
 
@@ -525,16 +690,42 @@ class PlayerViewModel(
             currentUri = item?.mediaId,
             currentTitle = item?.mediaMetadata?.title?.toString().orEmpty(),
             isPlaying = target.isPlaying,
-            isVideo = item?.mediaId?.let(MediaSupport::isVideoUri) == true,
+            isVideo = item?.localConfiguration?.mimeType?.startsWith("video/") == true,
             positionMs = target.currentPosition.coerceAtLeast(0L),
             durationMs = target.duration.takeIf { it > 0 } ?: 0L,
             playbackSpeed = target.playbackParameters.speed,
             hasNext = target.hasNextMediaItem(),
             hasPrevious = target.hasPreviousMediaItem(),
+            shuffleEnabled = target.shuffleModeEnabled,
+            repeatMode = target.repeatMode,
         )
     }
 
+    private fun applyPlaybackPrefs(target: MediaController) {
+        viewModelScope.launch {
+            val prefs = repository.getPlaybackPrefs()
+            target.playbackParameters = PlaybackParameters(prefs.speed)
+            target.shuffleModeEnabled = prefs.shuffleEnabled
+            target.repeatMode = prefs.repeatMode
+            refreshPlayerState()
+        }
+    }
+
+    private fun persistPlaybackPrefs() {
+        val target = controller ?: return
+        viewModelScope.launch {
+            repository.savePlaybackPrefs(
+                PlaybackPrefs(
+                    speed = target.playbackParameters.speed,
+                    shuffleEnabled = target.shuffleModeEnabled,
+                    repeatMode = target.repeatMode,
+                ),
+            )
+        }
+    }
+
     override fun onCleared() {
+        progressJob?.cancel()
         playerListener?.let { listener -> controller?.removeListener(listener) }
         controller?.release()
         controllerFuture?.cancel(true)
@@ -550,13 +741,27 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+            val context = LocalContext.current
             val permissionLauncher = rememberLauncherForActivityResult(
-                contract = ActivityResultContracts.RequestPermission(),
-                onResult = {},
+                contract = ActivityResultContracts.RequestMultiplePermissions(),
+                onResult = {
+                    viewModel.rescan()
+                },
             )
             LaunchedEffect(Unit) {
-                if (Build.VERSION.SDK_INT >= 33) {
-                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                val neededPermissions = buildList {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        add(Manifest.permission.POST_NOTIFICATIONS)
+                        add(Manifest.permission.READ_MEDIA_AUDIO)
+                        add(Manifest.permission.READ_MEDIA_VIDEO)
+                    } else {
+                        add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                    }
+                }.filter { permission ->
+                    ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED
+                }
+                if (neededPermissions.isNotEmpty()) {
+                    permissionLauncher.launch(neededPermissions.toTypedArray())
                 }
             }
             SlatePlayerTheme(amoled = uiState.amoled) {
@@ -577,6 +782,8 @@ class MainActivity : ComponentActivity() {
                         onSkipNext = viewModel::skipNext,
                         onSkipPrevious = viewModel::skipPrevious,
                         onSpeedChange = viewModel::setPlaybackSpeed,
+                        onToggleShuffle = viewModel::toggleShuffle,
+                        onCycleRepeatMode = viewModel::cycleRepeatMode,
                         onFolderPicked = viewModel::addFolder,
                     )
                 }
@@ -603,9 +810,12 @@ private fun PlayerScreen(
     onSkipNext: () -> Unit,
     onSkipPrevious: () -> Unit,
     onSpeedChange: (Float) -> Unit,
+    onToggleShuffle: () -> Unit,
+    onCycleRepeatMode: () -> Unit,
     onFolderPicked: (Uri, String) -> Unit,
 ) {
     val context = LocalContext.current
+    var inspectedMedia by remember { mutableStateOf<MediaEntry?>(null) }
     val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri ?: return@rememberLauncherForActivityResult
         val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -638,6 +848,31 @@ private fun PlayerScreen(
             dismissButton = {
                 TextButton(onClick = onDismissResume) {
                     Text("Not now")
+                }
+            },
+        )
+    }
+
+    inspectedMedia?.let { media ->
+        AlertDialog(
+            onDismissRequest = { inspectedMedia = null },
+            title = { Text(media.title) },
+            text = {
+                Text(
+                    buildString {
+                        append(if (media.isVideo) "Video" else "Audio")
+                        append("\n")
+                        append("Folder: ")
+                        append(media.folderName)
+                        append("\n")
+                        append("Duration: ")
+                        append(formatTime(media.durationMs))
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { inspectedMedia = null }) {
+                    Text("Close")
                 }
             },
         )
@@ -683,6 +918,8 @@ private fun PlayerScreen(
                     onSkipNext = onSkipNext,
                     onSkipPrevious = onSkipPrevious,
                     onSpeedChange = onSpeedChange,
+                    onToggleShuffle = onToggleShuffle,
+                    onCycleRepeatMode = onCycleRepeatMode,
                 )
             }
         },
@@ -709,7 +946,7 @@ private fun PlayerScreen(
                         VideoPlayerPreview(controller = controller)
                         Spacer(modifier = Modifier.height(12.dp))
                     }
-                    PlayerHeroCard(state = state, onRefresh = onRefresh, onAddFolder = { folderLauncher.launch(null) })
+                    PlayerHeroCard(state = state, onRefresh = onRefresh)
                     Spacer(modifier = Modifier.height(12.dp))
                     OutlinedTextField(
                         value = state.query,
@@ -727,11 +964,6 @@ private fun PlayerScreen(
                         state.folders.forEach { folder ->
                             FolderPill(folder = folder, onRemove = { onRemoveFolder(folder) })
                         }
-                        AssistChip(
-                            onClick = { folderLauncher.launch(null) },
-                            label = { Text("Add folder") },
-                            leadingIcon = { Icon(Icons.Rounded.FolderOpen, contentDescription = null) },
-                        )
                     }
                 }
             }
@@ -745,6 +977,7 @@ private fun PlayerScreen(
                         item = item,
                         active = state.playerState.currentUri == item.uriString,
                         onClick = { onPlay(item) },
+                        onLongPress = { inspectedMedia = item },
                     )
                 }
             }
@@ -759,7 +992,6 @@ private fun PlayerScreen(
 private fun PlayerHeroCard(
     state: PlayerUiState,
     onRefresh: () -> Unit,
-    onAddFolder: () -> Unit,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -806,7 +1038,6 @@ private fun PlayerHeroCard(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     AssistChip(onClick = onRefresh, label = { Text("Rescan") })
-                    AssistChip(onClick = onAddFolder, label = { Text("Add") })
                 }
             }
             Row(
@@ -906,16 +1137,22 @@ private fun EmptyLibraryCard(scanning: Boolean) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MediaRow(
     item: MediaEntry,
     active: Boolean,
     onClick: () -> Unit,
+    onLongPress: () -> Unit,
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp),
+            .padding(horizontal = 16.dp)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongPress,
+            ),
         colors = CardDefaults.cardColors(
             containerColor = if (active) {
                 MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.9f)
@@ -923,7 +1160,6 @@ private fun MediaRow(
                 MaterialTheme.colorScheme.surface
             },
         ),
-        onClick = onClick,
     ) {
         Row(
             modifier = Modifier
@@ -1008,6 +1244,8 @@ private fun MiniPlayerBar(
     onSkipNext: () -> Unit,
     onSkipPrevious: () -> Unit,
     onSpeedChange: (Float) -> Unit,
+    onToggleShuffle: () -> Unit,
+    onCycleRepeatMode: () -> Unit,
 ) {
     Surface(
         tonalElevation = 6.dp,
@@ -1049,19 +1287,45 @@ private fun MiniPlayerBar(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                AssistChip(onClick = { onJumpBy(-10_000L) }, label = { Text("-10s") })
+                AssistChip(onClick = { onJumpBy(-15_000L) }, label = { Text("-15s") })
+                AssistChip(onClick = { onJumpBy(-5_000L) }, label = { Text("-5s") })
                 IconButton(onClick = onSkipPrevious, enabled = playerState.hasPrevious) {
                     Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous")
                 }
                 IconButton(onClick = onSkipNext, enabled = playerState.hasNext) {
                     Icon(Icons.Rounded.SkipNext, contentDescription = "Next")
                 }
-                AssistChip(onClick = { onJumpBy(10_000L) }, label = { Text("+10s") })
+                AssistChip(onClick = { onJumpBy(5_000L) }, label = { Text("+5s") })
+                AssistChip(onClick = { onJumpBy(15_000L) }, label = { Text("+15s") })
             }
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                AssistChip(
+                    onClick = onToggleShuffle,
+                    label = { Text("Shuffle") },
+                    leadingIcon = {
+                        Icon(
+                            if (playerState.shuffleEnabled) Icons.Rounded.ShuffleOn else Icons.Rounded.Shuffle,
+                            contentDescription = null,
+                        )
+                    },
+                )
+                AssistChip(
+                    onClick = onCycleRepeatMode,
+                    label = { Text(repeatModeLabel(playerState.repeatMode)) },
+                    leadingIcon = {
+                        Icon(
+                            when (playerState.repeatMode) {
+                                Player.REPEAT_MODE_ONE -> Icons.Rounded.RepeatOne
+                                Player.REPEAT_MODE_ALL -> Icons.Rounded.RepeatOn
+                                else -> Icons.Rounded.Repeat
+                            },
+                            contentDescription = null,
+                        )
+                    },
+                )
                 listOf(0.8f, 1f, 1.25f, 1.5f, 2f).forEach { speed ->
                     AssistChip(
                         onClick = { onSpeedChange(speed) },
@@ -1074,6 +1338,12 @@ private fun MiniPlayerBar(
             }
         }
     }
+}
+
+private fun repeatModeLabel(repeatMode: Int): String = when (repeatMode) {
+    Player.REPEAT_MODE_ONE -> "Repeat 1"
+    Player.REPEAT_MODE_ALL -> "Repeat all"
+    else -> "Repeat off"
 }
 
 private fun formatTime(durationMs: Long): String {

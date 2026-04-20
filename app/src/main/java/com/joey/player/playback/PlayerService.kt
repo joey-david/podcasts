@@ -2,7 +2,6 @@ package com.joey.player.playback
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.preferencesDataStore
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Player
@@ -10,6 +9,7 @@ import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.joey.player.PlayerKeys
 import com.joey.player.ResumeState
+import com.joey.player.data.playerStore
 import com.joey.player.domain.MediaSupport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,8 +18,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-
-private val Context.playerStore by preferencesDataStore(name = "slate_player")
 
 class PlayerService : MediaSessionService() {
     private lateinit var player: androidx.media3.exoplayer.ExoPlayer
@@ -52,7 +50,10 @@ class PlayerService : MediaSessionService() {
                 true,
             )
             .build()
-            .apply { addListener(listener) }
+            .apply {
+                setHandleAudioBecomingNoisy(true)
+                addListener(listener)
+            }
         mediaSession = MediaSession.Builder(this, player).build()
         persistenceJob = serviceScope.launch {
             while (true) {
@@ -87,7 +88,7 @@ class PlayerService : MediaSessionService() {
             title = title,
             positionMs = position,
             durationMs = duration,
-            isVideo = MediaSupport.isVideoUri(current.mediaId),
+            isVideo = current.localConfiguration?.mimeType?.startsWith("video/") == true,
         )
         applicationContext.playerStore.edit { prefs ->
             prefs[PlayerKeys.lastUri] = resume.uriString
