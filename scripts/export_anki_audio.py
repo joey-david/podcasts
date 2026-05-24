@@ -33,6 +33,8 @@ PODDER_AUDIO_RE = re.compile(
     r"\s*<div class=['\"]podder-audio['\"]>\[sound:[^\]]+\]</div>\s*",
     flags=re.I,
 )
+LATEX_MARKER_RE = re.compile(r"(\[/?\$\$]|\$\$|\\\(|\\\[|\\[A-Za-z]+|[_^{}]|[=<>∑∫√∞λσμπ≈≤≥])")
+WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
 
 class TextExtractor(HTMLParser):
@@ -59,6 +61,8 @@ class CardAudio:
     answer_text: str
     spoken_text: str
     tts_segments: list[dict[str, str]]
+    audio_kind: str
+    audio_reason: str
     is_due: bool
     audio_file: str
     back_html: str
@@ -74,6 +78,8 @@ class CardAudio:
             "answerText": self.answer_text,
             "spokenText": self.spoken_text,
             "ttsSegments": self.tts_segments,
+            "audioKind": self.audio_kind,
+            "audioReason": self.audio_reason,
             "isDue": self.is_due,
             "audioFile": self.audio_file,
         }
@@ -126,13 +132,50 @@ def div_text(raw_html: str, class_name: str) -> str | None:
     return html_to_text(match.group(1))
 
 
+def formula_density(raw_html: str, clean: str) -> float:
+    compact = re.sub(r"\s+", "", raw_html or clean)
+    if not compact:
+        return 0.0
+    return len(LATEX_MARKER_RE.findall(raw_html or clean)) / len(compact)
+
+
+def looks_formula_heavy(raw_html: str, clean: str) -> bool:
+    if re.search(r"(\[\$\$]|\[/\$\$]|\$\$|\\frac|\\sum|\\int|\\sqrt|\\begin|\\end)", raw_html or "", re.I):
+        return True
+    symbol_count = len(re.findall(r"[=<>^_{}\\+\-*/|∑∫√∞≈≤≥]", raw_html or clean))
+    word_count = len(WORD_RE.findall(clean))
+    return symbol_count >= 8 and symbol_count > word_count * 1.5
+
+
+def looks_audio_unfriendly(raw_html: str, clean: str) -> tuple[bool, str]:
+    if not clean:
+        return True, "empty text"
+    if len(clean) > 900:
+        return True, "too long for one audio card"
+    if clean.count(";") + clean.count(",") > 18 and clean.count(".") < 2:
+        return True, "dense list"
+    if formula_density(raw_html, clean) > 0.08 and len(WORD_RE.findall(clean)) < 8:
+        return True, "mostly notation"
+    return False, ""
+
+
+def conceptual_formula_audio(front_text: str, back_text: str) -> str:
+    topic = front_text.rstrip(".?")
+    lower = topic.lower()
+    if any(token in lower for token in ("intuition", "conceptually", "why", "what is")):
+        return f"{topic}. Explain the idea in words, then check the exact notation visually in Anki."
+    if any(token in lower for token in ("pmf", "density", "loss", "objective", "bound", "theorem", "inequality")):
+        return f"Formula card: {topic}. Recall what each term means and the overall shape of the expression. Check the exact symbols visually in Anki."
+    return f"Formula-heavy card: {topic}. Use this audio as a prompt to recall the exact visual formula in Anki; do not rely on spoken notation for this one."
+
+
 def make_spoken_text(
     deck_name: str,
     front_html: str,
     back_html: str,
     english_voice: str,
     japanese_voice: str,
-) -> tuple[str, str, str, list[dict[str, str]]]:
+) -> tuple[str, str, str, list[dict[str, str]], str, str]:
     front_text = div_text(front_html, "japadict-front") or html_to_text(front_html)
     meaning = div_text(back_html, "japadict-meaning")
     back_text = meaning or html_to_text(back_html)
@@ -146,11 +189,20 @@ def make_spoken_text(
             {"voice": japanese_voice, "text": word},
             {"voice": english_voice, "text": f"is {translation}."},
         ]
-        return word, translation, spoken, segments
+        return word, translation, spoken, segments, "nice", "Japanese word plus translation"
 
     title = front_text
+    front_formula = looks_formula_heavy(front_html, front_text)
+    back_formula = looks_formula_heavy(back_html, back_text)
+    unfriendly, reason = looks_audio_unfriendly(front_html + "\n" + back_html, f"{front_text} {back_text}")
+    if front_formula or back_formula:
+        spoken = conceptual_formula_audio(front_text, back_text)
+        return title, back_text, spoken, [{"voice": english_voice, "text": spoken}], "conceptual", "formula-heavy card narrated conceptually"
+    if unfriendly:
+        spoken = f"{front_text}."
+        return title, back_text, spoken, [], "not_nice", reason
     spoken = f"{front_text}. The answer is {back_text}."
-    return title, back_text, spoken, [{"voice": english_voice, "text": spoken}]
+    return title, back_text, spoken, [{"voice": english_voice, "text": spoken}], "nice", "plain text card"
 
 
 def safe_stem(value: str) -> str:
@@ -174,7 +226,7 @@ def collect_cards(query: str, limit: int | None, english_voice: str, japanese_vo
             fields = info.get("fields", {})
             front = fields.get("Front", {}).get("value", "")
             back = fields.get("Back", {}).get("value", "")
-            title, answer, spoken, segments = make_spoken_text(
+            title, answer, spoken, segments, audio_kind, audio_reason = make_spoken_text(
                 info["deckName"],
                 front,
                 back,
@@ -195,6 +247,8 @@ def collect_cards(query: str, limit: int | None, english_voice: str, japanese_vo
                     answer_text=answer,
                     spoken_text=spoken,
                     tts_segments=segments,
+                    audio_kind=audio_kind,
+                    audio_reason=audio_reason,
                     is_due=info["cardId"] in due_ids,
                     audio_file=stem,
                     back_html=back,
@@ -211,6 +265,9 @@ def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) ->
         if card.note_id in seen_notes:
             continue
         seen_notes.add(card.note_id)
+        if not card.tts_segments:
+            skipped += 1
+            continue
         audio_path = output_dir / card.audio_file
         if not audio_path.exists() or audio_path.stat().st_size == 0:
             continue
@@ -325,7 +382,8 @@ async def synthesize(cards: list[CardAudio], output_dir: Path, force: bool, jobs
     missing = [
         (index, card)
         for index, card in enumerate(cards, start=1)
-        if force or not (output_dir / card.audio_file).exists() or (output_dir / card.audio_file).stat().st_size == 0
+        if card.tts_segments
+        and (force or not (output_dir / card.audio_file).exists() or (output_dir / card.audio_file).stat().st_size == 0)
     ]
     semaphore = asyncio.Semaphore(jobs)
 
@@ -345,6 +403,10 @@ def write_manifest(cards: list[CardAudio], output_dir: Path, query: str, voice: 
         "japaneseVoice": japanese_voice,
         "count": len(cards),
         "dueCount": sum(1 for card in cards if card.is_due),
+        "audioKindCounts": {
+            kind: sum(1 for card in cards if card.audio_kind == kind)
+            for kind in sorted({card.audio_kind for card in cards})
+        },
         "cards": [card.manifest_entry() for card in cards],
     }
     (output_dir / "manifest.json").write_text(
