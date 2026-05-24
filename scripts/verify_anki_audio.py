@@ -44,6 +44,21 @@ def main() -> int:
     if japanese_bad:
         fail(f"{len(japanese_bad)} Japanese cards do not use the expected phrase")
 
+    japanese_voice_bad = []
+    for card in cards:
+        if card.get("category") != "japanese":
+            continue
+        segments = card.get("ttsSegments")
+        if (
+            not isinstance(segments, list)
+            or len(segments) != 3
+            or not str(segments[1].get("voice", "")).startswith("ja-JP-")
+            or segments[1].get("text") != card.get("title")
+        ):
+            japanese_voice_bad.append(card.get("cardId"))
+    if japanese_voice_bad:
+        fail(f"{len(japanese_voice_bad)} Japanese cards do not use a dedicated ja-JP word segment")
+
     source = MAIN_ACTIVITY.read_text(encoding="utf-8")
     anki_block = source[source.find("private object AnkiDroidContract") :]
     forbidden = [

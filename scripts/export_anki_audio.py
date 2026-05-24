@@ -13,6 +13,7 @@ import base64
 import html
 import json
 import re
+import shlex
 import sys
 import time
 import urllib.error
@@ -20,11 +21,14 @@ import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
+import subprocess
+import tempfile
 
 
 ANKI_HELPER = Path("/home/joey/.codex/skills/anki-connect/scripts")
 DEFAULT_OUTPUT = Path("app/src/main/assets/anki_audio")
 DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
+DEFAULT_JAPANESE_VOICE = "ja-JP-NanamiNeural"
 PODDER_AUDIO_RE = re.compile(
     r"\s*<div class=['\"]podder-audio['\"]>\[sound:[^\]]+\]</div>\s*",
     flags=re.I,
@@ -54,6 +58,7 @@ class CardAudio:
     prompt_text: str
     answer_text: str
     spoken_text: str
+    tts_segments: list[dict[str, str]]
     is_due: bool
     audio_file: str
     back_html: str
@@ -68,6 +73,7 @@ class CardAudio:
             "promptText": self.prompt_text,
             "answerText": self.answer_text,
             "spokenText": self.spoken_text,
+            "ttsSegments": self.tts_segments,
             "isDue": self.is_due,
             "audioFile": self.audio_file,
         }
@@ -120,7 +126,13 @@ def div_text(raw_html: str, class_name: str) -> str | None:
     return html_to_text(match.group(1))
 
 
-def make_spoken_text(deck_name: str, front_html: str, back_html: str) -> tuple[str, str, str]:
+def make_spoken_text(
+    deck_name: str,
+    front_html: str,
+    back_html: str,
+    english_voice: str,
+    japanese_voice: str,
+) -> tuple[str, str, str, list[dict[str, str]]]:
     front_text = div_text(front_html, "japadict-front") or html_to_text(front_html)
     meaning = div_text(back_html, "japadict-meaning")
     back_text = meaning or html_to_text(back_html)
@@ -128,11 +140,17 @@ def make_spoken_text(deck_name: str, front_html: str, back_html: str) -> tuple[s
     if "japanese" in deck_name.lower() or meaning:
         word = front_text
         translation = meaning or back_text
-        return word, translation, f"The meaning of {word} is {translation}."
+        spoken = f"The meaning of {word} is {translation}."
+        segments = [
+            {"voice": english_voice, "text": "The meaning of"},
+            {"voice": japanese_voice, "text": word},
+            {"voice": english_voice, "text": f"is {translation}."},
+        ]
+        return word, translation, spoken, segments
 
     title = front_text
     spoken = f"{front_text}. The answer is {back_text}."
-    return title, back_text, spoken
+    return title, back_text, spoken, [{"voice": english_voice, "text": spoken}]
 
 
 def safe_stem(value: str) -> str:
@@ -144,7 +162,7 @@ def chunked(values: list[int], size: int) -> list[list[int]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
-def collect_cards(query: str, limit: int | None) -> list[CardAudio]:
+def collect_cards(query: str, limit: int | None, english_voice: str, japanese_voice: str) -> list[CardAudio]:
     all_card_ids = anki_invoke("findCards", query=query)
     if limit:
         all_card_ids = all_card_ids[:limit]
@@ -156,7 +174,13 @@ def collect_cards(query: str, limit: int | None) -> list[CardAudio]:
             fields = info.get("fields", {})
             front = fields.get("Front", {}).get("value", "")
             back = fields.get("Back", {}).get("value", "")
-            title, answer, spoken = make_spoken_text(info["deckName"], front, back)
+            title, answer, spoken, segments = make_spoken_text(
+                info["deckName"],
+                front,
+                back,
+                english_voice,
+                japanese_voice,
+            )
             deck_name = info["deckName"]
             category = deck_name.split("::", 1)[0]
             stem = f"{category}-{info['cardId']}-{safe_stem(title)}.mp3"
@@ -170,6 +194,7 @@ def collect_cards(query: str, limit: int | None) -> list[CardAudio]:
                     prompt_text=html_to_text(front),
                     answer_text=answer,
                     spoken_text=spoken,
+                    tts_segments=segments,
                     is_due=info["cardId"] in due_ids,
                     audio_file=stem,
                     back_html=back,
@@ -187,7 +212,7 @@ def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) ->
             continue
         seen_notes.add(card.note_id)
         audio_path = output_dir / card.audio_file
-        if not audio_path.exists():
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
             continue
 
         media_name = f"podder-{card.audio_file}"
@@ -226,16 +251,70 @@ def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) ->
         print("Triggered Anki sync")
 
 
-async def synthesize_one(card: CardAudio, output_dir: Path, voice: str, index: int, total: int) -> None:
+async def save_tts(text: str, voice: str, target: Path) -> None:
     import edge_tts
 
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            communicate = edge_tts.Communicate(text, voice=voice)
+            await communicate.save(str(target))
+            return
+        except Exception as exc:
+            last_error = exc
+            target.unlink(missing_ok=True)
+            if attempt == 4:
+                break
+            await asyncio.sleep(attempt * 2)
+    raise RuntimeError(f"TTS failed for voice={voice}: {last_error}") from last_error
+
+
+def concat_mp3(parts: list[Path], target: Path) -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as list_file:
+        list_path = Path(list_file.name)
+        for part in parts:
+            list_file.write(f"file {shlex.quote(str(part))}\n")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c",
+                "copy",
+                str(target),
+            ],
+            check=True,
+        )
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+async def synthesize_one(card: CardAudio, output_dir: Path, index: int, total: int) -> None:
     target = output_dir / card.audio_file
-    communicate = edge_tts.Communicate(card.spoken_text, voice=voice)
-    await communicate.save(str(target))
+    if len(card.tts_segments) == 1:
+        segment = card.tts_segments[0]
+        await save_tts(segment["text"], segment["voice"], target)
+    else:
+        with tempfile.TemporaryDirectory(prefix=f"podder-tts-{card.card_id}-") as tmp:
+            parts: list[Path] = []
+            for segment_index, segment in enumerate(card.tts_segments):
+                part = Path(tmp) / f"{segment_index:02d}.mp3"
+                await save_tts(segment["text"], segment["voice"], part)
+                parts.append(part)
+            concat_mp3(parts, target)
     print(f"[{index}/{total}] {target.name}")
 
 
-async def synthesize(cards: list[CardAudio], output_dir: Path, voice: str, force: bool, jobs: int) -> None:
+async def synthesize(cards: list[CardAudio], output_dir: Path, force: bool, jobs: int) -> None:
     try:
         import edge_tts
     except ImportError as exc:
@@ -246,23 +325,24 @@ async def synthesize(cards: list[CardAudio], output_dir: Path, voice: str, force
     missing = [
         (index, card)
         for index, card in enumerate(cards, start=1)
-        if force or not (output_dir / card.audio_file).exists()
+        if force or not (output_dir / card.audio_file).exists() or (output_dir / card.audio_file).stat().st_size == 0
     ]
     semaphore = asyncio.Semaphore(jobs)
 
     async def run(index: int, card: CardAudio) -> None:
         async with semaphore:
-            await synthesize_one(card, output_dir, voice, index, len(cards))
+            await synthesize_one(card, output_dir, index, len(cards))
 
     await asyncio.gather(*(run(index, card) for index, card in missing))
 
 
-def write_manifest(cards: list[CardAudio], output_dir: Path, query: str, voice: str) -> None:
+def write_manifest(cards: list[CardAudio], output_dir: Path, query: str, voice: str, japanese_voice: str) -> None:
     payload = {
         "schemaVersion": 1,
         "source": "AnkiConnect",
         "query": query,
         "voice": voice,
+        "japaneseVoice": japanese_voice,
         "count": len(cards),
         "dueCount": sum(1 for card in cards if card.is_due),
         "cards": [card.manifest_entry() for card in cards],
@@ -279,6 +359,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Limit cards for test exports.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--voice", default=DEFAULT_VOICE)
+    parser.add_argument("--japanese-voice", default=DEFAULT_JAPANESE_VOICE)
     parser.add_argument("--force", action="store_true", help="Regenerate existing mp3 files.")
     parser.add_argument("--jobs", type=int, default=4, help="Concurrent TTS requests.")
     parser.add_argument("--manifest-only", action="store_true", help="Skip speech generation.")
@@ -298,11 +379,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    cards = collect_cards(args.query, args.limit)
-    write_manifest(cards, args.output, args.query, args.voice)
+    cards = collect_cards(args.query, args.limit, args.voice, args.japanese_voice)
+    write_manifest(cards, args.output, args.query, args.voice, args.japanese_voice)
     print(f"Wrote {len(cards)} manifest entries to {args.output / 'manifest.json'}")
     if not args.manifest_only:
-        asyncio.run(synthesize(cards, args.output, args.voice, args.force, args.jobs))
+        asyncio.run(synthesize(cards, args.output, args.force, args.jobs))
     if args.embed_in_anki:
         embed_audio_in_anki(cards, args.output, args.sync)
     return 0

@@ -35,7 +35,8 @@ python3 scripts/export_anki_audio.py --query 'deck:*' --jobs 4 --embed-in-anki -
 The exporter uses AnkiConnect read/update/media endpoints only. It does not answer
 cards or call review endpoints, so listening in Podder does not mark cards as
 reviewed. Japanese `japadict` cards are spoken as `The meaning of [word] is
-[translation].`
+[translation].` The exporter synthesizes the Japanese word as a separate
+`ja-JP` voice segment, so it is not pronounced by the English voice.
 
 On Android, Podder first tries to read the synced AnkiDroid collection through
 AnkiDroid's content provider using `deck:*` and `is:due` searches. It only uses
