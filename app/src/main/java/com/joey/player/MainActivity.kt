@@ -123,8 +123,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import java.io.File
 import java.util.Locale
 
@@ -166,20 +164,19 @@ data class AnkiAudioCard(
     val spokenText: String,
     val isDue: Boolean,
     val audioFile: String = "",
+    val ankiMediaFile: String = "",
+    val audioUriString: String = "",
     val origin: String = "Bundled export",
 ) {
     fun asMediaEntry(): MediaEntry =
         MediaEntry(
-            uriString = "tts://anki/$cardId",
+            uriString = audioUriString,
             title = title,
             folderName = deckName,
             durationMs = 0L,
             isVideo = false,
-            mimeType = "audio/tts",
+            mimeType = MediaSupport.inferMimeType(audioUriString),
         )
-
-    fun ttsText(): String =
-        spokenText.replace(Regex("""\[sound:[^\]]+]"""), "").trim()
 }
 
 data class AnkiAudioLibrary(
@@ -395,7 +392,7 @@ class PlayerRepository(
 
     suspend fun loadAnkiAudioCards(): AnkiAudioLibrary = withContext(Dispatchers.IO) {
         val bundled = loadBundledAnkiAudioCards()
-        val liveResult = runCatching { loadAnkiDroidAudioCards(bundled.associateBy { it.audioFile }) }
+        val liveResult = runCatching { loadAnkiDroidAudioCards() }
         liveResult.getOrNull()?.takeIf { it.isNotEmpty() }?.let { liveCards ->
             return@withContext AnkiAudioLibrary(
                 cards = liveCards.sortedWith(compareBy(AnkiAudioCard::category, AnkiAudioCard::title)),
@@ -427,24 +424,26 @@ class PlayerRepository(
                             spokenText = item.optString("spokenText"),
                             isDue = item.optBoolean("isDue"),
                             audioFile = item.optString("audioFile"),
+                            ankiMediaFile = item.optString("audioFile").takeIf { it.isNotBlank() }?.let { "podder-$it" }.orEmpty(),
+                            audioUriString = bundledAssetUri(item.optString("audioFile")).orEmpty(),
                             origin = "Bundled export",
                         )
                     )
                 }
             }.filter { card ->
-                card.spokenText.isNotBlank()
+                card.audioUriString.isNotBlank()
             }
         }.getOrDefault(emptyList())
 
-    private fun loadAnkiDroidAudioCards(bundledByFile: Map<String, AnkiAudioCard>): List<AnkiAudioCard> {
+    private fun loadAnkiDroidAudioCards(): List<AnkiAudioCard> {
         if (!isPackageInstalled(AnkiDroidContract.packageName)) {
             return emptyList()
         }
 
         val deckNames = loadAnkiDroidDeckNames()
-        val allCards = queryAnkiDroidCards("deck:*", deckNames, bundledByFile).associateBy { it.cardId }
+        val allCards = queryAnkiDroidCards("deck:*", deckNames).associateBy { it.cardId }
         if (allCards.isEmpty()) return emptyList()
-        val dueIds = queryAnkiDroidCards("is:due", deckNames, bundledByFile).mapTo(mutableSetOf()) { it.cardId }
+        val dueIds = queryAnkiDroidCards("is:due", deckNames).mapTo(mutableSetOf()) { it.cardId }
         return allCards.values.map { card ->
             card.copy(isDue = card.cardId in dueIds)
         }
@@ -469,7 +468,6 @@ class PlayerRepository(
     private fun queryAnkiDroidCards(
         query: String,
         deckNames: Map<Long, String>,
-        bundledByFile: Map<String, AnkiAudioCard>,
     ): List<AnkiAudioCard> {
         val projection = arrayOf(
             AnkiDroidContract.Card.id,
@@ -483,18 +481,26 @@ class PlayerRepository(
                 buildList {
                     while (cursor.moveToNext()) {
                         val answer = cursor.getStringOrBlank(AnkiDroidContract.Card.answerPure)
-                        val syncedAudioFile = extractPodderAudioFile(answer) ?: continue
-                        val bundled = bundledByFile[syncedAudioFile] ?: continue
-                        val deckName = deckNames[cursor.getLong(AnkiDroidContract.Card.deckId)] ?: bundled.deckName
+                        val ankiMediaFile = extractPodderMediaFile(answer) ?: continue
+                        val audioFile = ankiMediaFile.removePrefix("podder-")
+                        val audioUri = resolveAnkiDroidMediaUri(ankiMediaFile) ?: bundledAssetUri(audioFile) ?: continue
+                        val deckName = deckNames[cursor.getLong(AnkiDroidContract.Card.deckId)] ?: "Anki"
+                        val title = htmlToPlainText(cursor.getStringOrBlank(AnkiDroidContract.Card.questionSimple))
+                            .ifBlank { audioFile.substringBeforeLast('.').ifBlank { "Anki card" } }
+                        val answerText = htmlToPlainText(answer)
                         add(
-                            bundled.copy(
+                            AnkiAudioCard(
                                 cardId = cursor.getLong(AnkiDroidContract.Card.id),
                                 noteId = cursor.getLong(AnkiDroidContract.Card.noteId),
                                 deckName = deckName,
                                 category = deckName.substringBefore("::").ifBlank { deckName },
-                                title = htmlToPlainText(cursor.getStringOrBlank(AnkiDroidContract.Card.questionSimple))
-                                    .ifBlank { bundled.title },
-                                answerText = htmlToPlainText(answer).ifBlank { bundled.answerText },
+                                title = title,
+                                answerText = answerText,
+                                spokenText = answerText,
+                                isDue = false,
+                                audioFile = audioFile,
+                                ankiMediaFile = ankiMediaFile,
+                                audioUriString = audioUri,
                                 origin = "AnkiDroid synced collection",
                             )
                         )
@@ -503,6 +509,58 @@ class PlayerRepository(
             }
             .orEmpty()
     }
+
+    private fun resolveAnkiDroidMediaUri(fileName: String): String? =
+        resolveIndexedAnkiDroidMediaUri(fileName)
+            ?: resolveLegacyAnkiDroidMediaFile(fileName)
+
+    private fun resolveIndexedAnkiDroidMediaUri(fileName: String): String? {
+        val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.MediaColumns.RELATIVE_PATH,
+        )
+        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME}=?"
+        return context.contentResolver.query(uri, projection, selection, arrayOf(fileName), null)
+            ?.use { cursor ->
+                val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                val pathIndex = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                var fallback: String? = null
+                while (cursor.moveToNext()) {
+                    val contentUri = ContentUris.withAppendedId(uri, cursor.getLong(idIndex)).toString()
+                    val relativePath = if (pathIndex >= 0) cursor.getString(pathIndex).orEmpty() else ""
+                    if (relativePath.contains("AnkiDroid", ignoreCase = true) ||
+                        relativePath.contains("collection.media", ignoreCase = true)
+                    ) {
+                        return@use contentUri
+                    }
+                    fallback = fallback ?: contentUri
+                }
+                fallback
+            }
+    }
+
+    private fun resolveLegacyAnkiDroidMediaFile(fileName: String): String? {
+        val roots = listOfNotNull(
+            Environment.getExternalStorageDirectory(),
+            File("/sdcard"),
+        ).distinctBy { it.absolutePath }
+        val candidates = roots.flatMap { root ->
+            listOf(
+                File(root, "AnkiDroid/collection.media/$fileName"),
+                File(root, "Android/data/${AnkiDroidContract.packageName}/files/AnkiDroid/collection.media/$fileName"),
+            )
+        }
+        return candidates.firstOrNull { it.isFile && it.canRead() }?.let { Uri.fromFile(it).toString() }
+    }
+
+    private fun bundledAssetUri(fileName: String): String? =
+        fileName.takeIf { it.isNotBlank() && bundledAssetExists(it) }?.let { "asset:///anki_audio/$it" }
+
+    private fun bundledAssetExists(fileName: String): Boolean =
+        runCatching {
+            context.assets.open("anki_audio/$fileName").use { true }
+        }.getOrDefault(false)
 
     private fun scanYoutubeFolder(): List<MediaEntry> {
         val root = youtubeDirectory()
@@ -650,8 +708,8 @@ private fun Cursor.getLong(column: String): Long =
         if (isNull(index)) 0L else getLong(index)
     } ?: 0L
 
-private fun extractPodderAudioFile(answerHtml: String): String? {
-    val match = Regex("""\[sound:podder-([^\]]+)]""").find(answerHtml) ?: return null
+private fun extractPodderMediaFile(answerHtml: String): String? {
+    val match = Regex("""\[sound:(podder-[^\]]+)]""").find(answerHtml) ?: return null
     return match.groupValues[1]
 }
 
@@ -694,10 +752,6 @@ class PlayerViewModel(
     private val youtubeProgress = MutableStateFlow<Float?>(null)
     private val youtubeStatus = MutableStateFlow<String?>(null)
     private val playerState = MutableStateFlow(PlayerState())
-    private val isAnkiPlaying = MutableStateFlow(false)
-    private var ankiPlaybackQueue: List<AnkiAudioCard> = emptyList()
-    private var ankiPlaybackIndex: Int = -1
-    private var tts: TextToSpeech? = null
     var controller by mutableStateOf<ExoPlayer?>(null)
         private set
 
@@ -756,27 +810,6 @@ class PlayerViewModel(
 
     init {
         loadFolders()
-    }
-
-    private fun initTts(context: Context) {
-        tts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = Locale.US
-            }
-        }
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) {
-                speakNextAnkiCard()
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                speakNextAnkiCard()
-            }
-            override fun onError(utteranceId: String?, errorCode: Int) {
-                speakNextAnkiCard()
-            }
-        })
     }
 
     fun setQuery(value: String) {
@@ -838,53 +871,15 @@ class PlayerViewModel(
     }
 
     fun playAnkiCards(cards: List<AnkiAudioCard>, startCard: AnkiAudioCard? = null) {
-        stopAnkiPlayback()
-        ensureTts()
-        ankiPlaybackQueue = cards
-        ankiPlaybackIndex = startCard?.let { selected ->
-            cards.indexOfFirst { it.cardId == selected.cardId }
+        val playable = cards.mapNotNull { card ->
+            card.asMediaEntry().takeIf { it.uriString.isNotBlank() }
+        }
+        if (playable.isEmpty()) return
+        val startIndex = startCard?.let { selected ->
+            playable.indexOfFirst { it.uriString == selected.audioUriString }
         }?.coerceAtLeast(0) ?: 0
-        speakCurrentAnkiCard()
-    }
-
-    private fun speakCurrentAnkiCard() {
-        if (ankiPlaybackIndex !in ankiPlaybackQueue.indices) {
-            stopAnkiPlayback()
-            return
-        }
-        val card = ankiPlaybackQueue[ankiPlaybackIndex]
-        val text = card.ttsText()
-        if (text.isBlank()) {
-            ankiPlaybackIndex++
-            speakCurrentAnkiCard()
-            return
-        }
-        isAnkiPlaying.value = true
-        val media = card.asMediaEntry()
-        playerState.value = PlayerState(
-            currentUri = media.uriString,
-            currentTitle = card.title,
-            isPlaying = true,
-            isVideo = false,
-            positionMs = 0L,
-            durationMs = 0L,
-            hasNext = ankiPlaybackIndex < ankiPlaybackQueue.lastIndex,
-            hasPrevious = ankiPlaybackIndex > 0,
-        )
-        val params = android.os.Bundle()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "anki_${card.cardId}")
-    }
-
-    private fun speakNextAnkiCard() {
-        ankiPlaybackIndex++
-        speakCurrentAnkiCard()
-    }
-
-    private fun stopAnkiPlayback() {
-        tts?.stop()
-        isAnkiPlaying.value = false
-        if (ankiPlaybackQueue.isNotEmpty()) {
-            playerState.value = playerState.value.copy(isPlaying = false)
+        ensureController { target ->
+            playList(playable, startIndex, 0L, target)
         }
     }
 
@@ -906,10 +901,6 @@ class PlayerViewModel(
     }
 
     fun togglePlayPause() {
-        if (isAnkiPlaying.value) {
-            stopAnkiPlayback()
-            return
-        }
         ensureController { target ->
             if (target.isPlaying) target.pause() else target.play()
             refreshPlayerState()
@@ -917,10 +908,6 @@ class PlayerViewModel(
     }
 
     fun skipNext() {
-        if (isAnkiPlaying.value) {
-            speakNextAnkiCard()
-            return
-        }
         controller?.let {
             it.seekToNext()
             refreshPlayerState()
@@ -928,12 +915,6 @@ class PlayerViewModel(
     }
 
     fun skipPrevious() {
-        if (isAnkiPlaying.value) {
-            ankiPlaybackIndex = (ankiPlaybackIndex - 1).coerceAtLeast(0)
-            tts?.stop()
-            speakCurrentAnkiCard()
-            return
-        }
         controller?.seekToPrevious()
         refreshPlayerState()
     }
@@ -1025,12 +1006,6 @@ class PlayerViewModel(
         startProgressUpdates()
         applyPlaybackPrefs(target)
         onReady(target)
-    }
-
-    private fun ensureTts() {
-        if (tts == null) {
-            initTts(appContext)
-        }
     }
 
     private fun startProgressUpdates() {
@@ -1129,8 +1104,6 @@ class PlayerViewModel(
     }
 
     override fun onCleared() {
-        stopAnkiPlayback()
-        tts?.shutdown()
         progressJob?.cancel()
         playerListener?.let { listener -> controller?.removeListener(listener) }
         controller?.release()

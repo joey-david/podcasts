@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ROOT / "app/src/main/assets/anki_audio"
-MANIFEST = ASSETS / "manifest.json"
+AUDIO_EXPORT = ROOT / "generated/anki_audio"
+MANIFEST = AUDIO_EXPORT / "manifest.json"
 MAIN_ACTIVITY = ROOT / "app/src/main/java/com/joey/player/MainActivity.kt"
 
 
@@ -28,8 +28,8 @@ def main() -> int:
         fail("manifest has no cards")
 
     audio_files = [card.get("audioFile", "") for card in cards]
-    missing = [name for name in audio_files if not name or not (ASSETS / name).exists()]
-    extras = sorted(path.name for path in ASSETS.glob("*.mp3") if path.name not in set(audio_files))
+    missing = [name for name in audio_files if not name or not (AUDIO_EXPORT / name).exists()]
+    extras = sorted(path.name for path in AUDIO_EXPORT.glob("*.mp3") if path.name not in set(audio_files))
     if missing:
         fail(f"{len(missing)} manifest audio files are missing")
     if extras:
@@ -73,6 +73,17 @@ def main() -> int:
     for pattern in forbidden:
         if re.search(pattern, anki_block):
             fail(f"forbidden AnkiDroid mutation/review token found: {pattern}")
+    required = [
+        "resolveAnkiDroidMediaUri",
+        "resolveIndexedAnkiDroidMediaUri",
+        "MediaStore.Files.getContentUri",
+        "asset:///anki_audio/",
+    ]
+    for token in required:
+        if token not in anki_block:
+            fail(f"missing AnkiDroid media playback token: {token}")
+    if "tts://anki" in anki_block or "TextToSpeech" in anki_block:
+        fail("Anki playback must use synced MP3 media, not Android TextToSpeech")
 
     print(
         "ok",

@@ -26,7 +26,7 @@ import tempfile
 
 
 ANKI_HELPER = Path("/home/joey/.codex/skills/anki-connect/scripts")
-DEFAULT_OUTPUT = Path("app/src/main/assets/anki_audio")
+DEFAULT_OUTPUT = Path("generated/anki_audio")
 DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
 DEFAULT_JAPANESE_VOICE = "ja-JP-NanamiNeural"
 PODDER_AUDIO_RE = re.compile(
