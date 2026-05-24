@@ -26,8 +26,8 @@ android {
         applicationId = "com.joey.player"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.0.1"
     }
 
     signingConfigs {
@@ -46,7 +46,8 @@ android {
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -65,7 +66,7 @@ android {
 
     buildFeatures {
         compose = true
-        buildConfig = true
+        buildConfig = false
     }
 
     composeOptions {
@@ -73,6 +74,9 @@ android {
     }
 
     packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -93,12 +97,8 @@ dependencies {
     implementation(libs.compose.foundation)
     implementation(libs.compose.runtime)
     implementation(libs.compose.material.icons)
-    implementation(libs.google.material)
-    implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.documentfile)
     implementation(libs.androidx.media3.exoplayer)
-    implementation(libs.androidx.media3.session)
-    implementation(libs.androidx.media3.ui)
     implementation(libs.kotlinx.coroutines.android)
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)

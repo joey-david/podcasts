@@ -2,14 +2,16 @@ package com.joey.player
 
 import android.Manifest
 import android.app.Application
-import android.content.ComponentName
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.database.Cursor
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
 import android.provider.DocumentsContract
 import androidx.activity.ComponentActivity
@@ -45,11 +47,9 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.GraphicEq
-import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.PauseCircle
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -63,6 +63,8 @@ import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.ShuffleOn
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
+import androidx.compose.material.icons.rounded.SmartDisplay
+import androidx.compose.material.icons.rounded.School
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
@@ -96,62 +98,47 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import android.content.pm.PackageManager
-import androidx.datastore.preferences.core.booleanPreferencesKey
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.emptyPreferences
-import androidx.datastore.preferences.core.floatPreferencesKey
-import androidx.datastore.preferences.core.intPreferencesKey
-import androidx.datastore.preferences.core.longPreferencesKey
-import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.session.MediaController
-import androidx.media3.session.SessionToken
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
-import com.google.common.util.concurrent.ListenableFuture
-import com.joey.player.data.playerStore
+import androidx.media3.exoplayer.ExoPlayer
 import com.joey.player.domain.MediaSupport
-import com.joey.player.playback.PlayerService
 import com.joey.player.ui.theme.SlatePlayerTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import java.io.File
 import java.util.Locale
 
 object PlayerKeys {
-    val amoled = booleanPreferencesKey("amoled")
-    val folders = stringPreferencesKey("folders")
-    val lastUri = stringPreferencesKey("last_uri")
-    val lastTitle = stringPreferencesKey("last_title")
-    val lastPosition = longPreferencesKey("last_position")
-    val lastDuration = longPreferencesKey("last_duration")
-    val lastIsVideo = booleanPreferencesKey("last_is_video")
-    val playbackSpeed = floatPreferencesKey("playback_speed")
-    val shuffleEnabled = booleanPreferencesKey("shuffle_enabled")
-    val repeatMode = intPreferencesKey("repeat_mode")
+    const val amoled = "amoled"
+    const val folders = "folders"
+    const val lastUri = "last_uri"
+    const val lastTitle = "last_title"
+    const val lastPosition = "last_position"
+    const val lastDuration = "last_duration"
+    const val lastIsVideo = "last_is_video"
+    const val playbackSpeed = "playback_speed"
+    const val shuffleEnabled = "shuffle_enabled"
+    const val repeatMode = "repeat_mode"
 }
 
 data class MediaFolder(
@@ -166,6 +153,39 @@ data class MediaEntry(
     val durationMs: Long,
     val isVideo: Boolean,
     val mimeType: String? = null,
+    val deletable: Boolean = false,
+)
+
+data class AnkiAudioCard(
+    val cardId: Long,
+    val noteId: Long,
+    val deckName: String,
+    val category: String,
+    val title: String,
+    val answerText: String,
+    val spokenText: String,
+    val isDue: Boolean,
+    val audioFile: String = "",
+    val origin: String = "Bundled export",
+) {
+    fun asMediaEntry(): MediaEntry =
+        MediaEntry(
+            uriString = "tts://anki/$cardId",
+            title = title,
+            folderName = deckName,
+            durationMs = 0L,
+            isVideo = false,
+            mimeType = "audio/tts",
+        )
+
+    fun ttsText(): String =
+        spokenText.replace(Regex("""\[sound:[^\]]+]"""), "").trim()
+}
+
+data class AnkiAudioLibrary(
+    val cards: List<AnkiAudioCard>,
+    val source: String,
+    val error: String? = null,
 )
 
 data class ResumeState(
@@ -200,36 +220,73 @@ data class PlayerUiState(
     val amoled: Boolean = false,
     val folders: List<MediaFolder> = emptyList(),
     val media: List<MediaEntry> = emptyList(),
+    val ankiCards: List<AnkiAudioCard> = emptyList(),
+    val ankiSource: String = "Bundled export",
+    val ankiError: String? = null,
     val query: String = "",
     val scanning: Boolean = false,
+    val youtubeDownloading: Boolean = false,
+    val youtubeProgress: Float? = null,
+    val youtubeStatus: String? = null,
     val resumeState: ResumeState? = null,
     val playerState: PlayerState = PlayerState(),
 )
+
+data class FolderMediaGroup(
+    val folder: MediaFolder,
+    val items: List<MediaEntry>,
+)
+
+private data class YoutubeUiInputs(
+    val filteredMedia: Pair<String, List<MediaEntry>>,
+    val scanning: Boolean,
+    val playerState: PlayerState,
+    val youtube: Triple<Boolean, Float?, String?>,
+)
+
+private data class AnkiUiInputs(
+    val amoled: Boolean,
+    val resume: ResumeState?,
+    val folders: List<MediaFolder>,
+    val ankiLibrary: AnkiAudioLibrary,
+)
+
+private object AnkiDroidContract {
+    const val packageName = "com.ichi2.anki"
+    const val permission = "com.ichi2.anki.permission.READ_WRITE_DATABASE"
+    private const val authority = "com.ichi2.anki.flashcards"
+    val cardsUri: Uri = Uri.parse("content://$authority/cards")
+    val decksUri: Uri = Uri.parse("content://$authority/decks")
+
+    object Card {
+        const val id = "_id"
+        const val noteId = "note_id"
+        const val deckId = "deck_id"
+        const val questionSimple = "question_simple"
+        const val answerPure = "answer_pure"
+    }
+
+    object Deck {
+        const val deckId = "deck_id"
+        const val deckName = "deck_name"
+    }
+}
 
 class PlayerRepository(
     private val context: Context,
 ) {
     private val separator = "\u0001"
+    private val youtubeFolderName = "YouTube"
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences("slate_player", Context.MODE_PRIVATE)
+    private val amoledState = MutableStateFlow(prefs.getBoolean(PlayerKeys.amoled, false))
+    private val resumeState = MutableStateFlow(loadResume())
 
-    val amoledFlow: Flow<Boolean> = context.playerStore.data
-        .catch { emit(emptyPreferences()) }
-        .map { it[PlayerKeys.amoled] ?: false }
-
-    val resumeFlow: Flow<ResumeState?> = context.playerStore.data
-        .catch { emit(emptyPreferences()) }
-        .map { prefs ->
-            val uri = prefs[PlayerKeys.lastUri] ?: return@map null
-            ResumeState(
-                uriString = uri,
-                title = prefs[PlayerKeys.lastTitle] ?: "Last media",
-                positionMs = prefs[PlayerKeys.lastPosition] ?: 0L,
-                durationMs = prefs[PlayerKeys.lastDuration] ?: 0L,
-                isVideo = prefs[PlayerKeys.lastIsVideo] ?: false,
-            )
-        }
+    val amoledFlow: Flow<Boolean> = amoledState
+    val resumeFlow: Flow<ResumeState?> = resumeState
 
     suspend fun getFolders(): List<MediaFolder> {
-        val raw = context.playerStore.data.first()[PlayerKeys.folders].orEmpty()
+        val raw = prefs.getString(PlayerKeys.folders, "").orEmpty()
         return raw.split("\n")
             .filter { it.isNotBlank() && it.contains(separator) }
             .map {
@@ -240,47 +297,44 @@ class PlayerRepository(
 
     suspend fun addFolder(uri: Uri, name: String) {
         val encoded = encodeFolder(MediaFolder(uri.toString(), name))
-        context.playerStore.edit { prefs ->
-            val current = prefs[PlayerKeys.folders].orEmpty()
-                .split("\n")
-                .filter { it.isNotBlank() }
-                .toMutableSet()
-            current.removeAll { it.startsWith(uri.toString() + separator) }
-            current += encoded
-            prefs[PlayerKeys.folders] = current.sorted().joinToString("\n")
-        }
+        val current = prefs.getString(PlayerKeys.folders, "").orEmpty()
+            .split("\n")
+            .filter { it.isNotBlank() }
+            .toMutableSet()
+        current.removeAll { it.startsWith(uri.toString() + separator) }
+        current += encoded
+        prefs.edit().putString(PlayerKeys.folders, current.sorted().joinToString("\n")).apply()
     }
 
     suspend fun removeFolder(folder: MediaFolder) {
-        context.playerStore.edit { prefs ->
-            val current = prefs[PlayerKeys.folders].orEmpty()
-                .split("\n")
-                .filter { it.isNotBlank() }
-                .filterNot { it.startsWith(folder.uriString + separator) }
-            prefs[PlayerKeys.folders] = current.joinToString("\n")
-        }
+        val current = prefs.getString(PlayerKeys.folders, "").orEmpty()
+            .split("\n")
+            .filter { it.isNotBlank() }
+            .filterNot { it.startsWith(folder.uriString + separator) }
+        prefs.edit().putString(PlayerKeys.folders, current.joinToString("\n")).apply()
     }
 
     suspend fun setAmoled(enabled: Boolean) {
-        context.playerStore.edit { it[PlayerKeys.amoled] = enabled }
+        prefs.edit().putBoolean(PlayerKeys.amoled, enabled).apply()
+        amoledState.value = enabled
     }
 
     suspend fun saveResume(resume: ResumeState) {
-        context.playerStore.edit { prefs ->
-            prefs[PlayerKeys.lastUri] = resume.uriString
-            prefs[PlayerKeys.lastTitle] = resume.title
-            prefs[PlayerKeys.lastPosition] = resume.positionMs
-            prefs[PlayerKeys.lastDuration] = resume.durationMs
-            prefs[PlayerKeys.lastIsVideo] = resume.isVideo
-        }
+        prefs.edit()
+            .putString(PlayerKeys.lastUri, resume.uriString)
+            .putString(PlayerKeys.lastTitle, resume.title)
+            .putLong(PlayerKeys.lastPosition, resume.positionMs)
+            .putLong(PlayerKeys.lastDuration, resume.durationMs)
+            .putBoolean(PlayerKeys.lastIsVideo, resume.isVideo)
+            .apply()
+        resumeState.value = resume
     }
 
     suspend fun getPlaybackPrefs(): PlaybackPrefs {
-        val prefs = context.playerStore.data.first()
-        val storedRepeatMode = prefs[PlayerKeys.repeatMode] ?: Player.REPEAT_MODE_OFF
+        val storedRepeatMode = prefs.getInt(PlayerKeys.repeatMode, Player.REPEAT_MODE_OFF)
         return PlaybackPrefs(
-            speed = (prefs[PlayerKeys.playbackSpeed] ?: 1f).coerceIn(0.5f, 3f),
-            shuffleEnabled = prefs[PlayerKeys.shuffleEnabled] ?: false,
+            speed = prefs.getFloat(PlayerKeys.playbackSpeed, 1f).coerceIn(0.5f, 3f),
+            shuffleEnabled = prefs.getBoolean(PlayerKeys.shuffleEnabled, false),
             repeatMode = storedRepeatMode.takeIf {
                 it == Player.REPEAT_MODE_OFF ||
                     it == Player.REPEAT_MODE_ONE ||
@@ -290,30 +344,205 @@ class PlayerRepository(
     }
 
     suspend fun savePlaybackPrefs(prefs: PlaybackPrefs) {
-        context.playerStore.edit {
-            it[PlayerKeys.playbackSpeed] = prefs.speed
-            it[PlayerKeys.shuffleEnabled] = prefs.shuffleEnabled
-            it[PlayerKeys.repeatMode] = prefs.repeatMode
-        }
+        this.prefs.edit()
+            .putFloat(PlayerKeys.playbackSpeed, prefs.speed)
+            .putBoolean(PlayerKeys.shuffleEnabled, prefs.shuffleEnabled)
+            .putInt(PlayerKeys.repeatMode, prefs.repeatMode)
+            .apply()
     }
 
     suspend fun clearResume() {
-        context.playerStore.edit { prefs ->
-            prefs.remove(PlayerKeys.lastUri)
-            prefs.remove(PlayerKeys.lastTitle)
-            prefs.remove(PlayerKeys.lastPosition)
-            prefs.remove(PlayerKeys.lastDuration)
-            prefs.remove(PlayerKeys.lastIsVideo)
+        prefs.edit()
+            .remove(PlayerKeys.lastUri)
+            .remove(PlayerKeys.lastTitle)
+            .remove(PlayerKeys.lastPosition)
+            .remove(PlayerKeys.lastDuration)
+            .remove(PlayerKeys.lastIsVideo)
+            .apply()
+        resumeState.value = null
+    }
+
+    private fun loadResume(): ResumeState? {
+        val uri = prefs.getString(PlayerKeys.lastUri, null) ?: return null
+        return ResumeState(
+            uriString = uri,
+            title = prefs.getString(PlayerKeys.lastTitle, "Last media") ?: "Last media",
+            positionMs = prefs.getLong(PlayerKeys.lastPosition, 0L),
+            durationMs = prefs.getLong(PlayerKeys.lastDuration, 0L),
+            isVideo = prefs.getBoolean(PlayerKeys.lastIsVideo, false),
+        )
+    }
+
+    suspend fun deleteMedia(entry: MediaEntry): Boolean = withContext(Dispatchers.IO) {
+        if (!entry.deletable) return@withContext false
+        val uri = Uri.parse(entry.uriString)
+        when (uri.scheme) {
+            "file" -> uri.path?.let { File(it).delete() } == true
+            "content" -> runCatching { context.contentResolver.delete(uri, null, null) > 0 }.getOrDefault(false)
+            else -> false
         }
     }
 
     suspend fun scanMedia(folders: List<MediaFolder>): List<MediaEntry> = withContext(Dispatchers.IO) {
-        folders.flatMap { folder ->
+        val folderMedia = folders.flatMap { folder ->
             scanIndexedMedia(folder) ?: run {
                 val root = DocumentFile.fromTreeUri(context, Uri.parse(folder.uriString)) ?: return@flatMap emptyList()
                 scanFolder(root, folder.name)
             }
-        }.sortedWith(compareBy(MediaEntry::folderName, MediaEntry::title))
+        }
+        (scanYoutubeFolder() + folderMedia).sortedWith(compareBy(MediaEntry::folderName, MediaEntry::title))
+    }
+
+    suspend fun loadAnkiAudioCards(): AnkiAudioLibrary = withContext(Dispatchers.IO) {
+        val bundled = loadBundledAnkiAudioCards()
+        val liveResult = runCatching { loadAnkiDroidAudioCards(bundled.associateBy { it.audioFile }) }
+        liveResult.getOrNull()?.takeIf { it.isNotEmpty() }?.let { liveCards ->
+            return@withContext AnkiAudioLibrary(
+                cards = liveCards.sortedWith(compareBy(AnkiAudioCard::category, AnkiAudioCard::title)),
+                source = "AnkiDroid synced collection",
+            )
+        }
+        AnkiAudioLibrary(
+            cards = bundled,
+            source = "Bundled export",
+            error = liveResult.exceptionOrNull()?.message,
+        )
+    }
+
+    private fun loadBundledAnkiAudioCards(): List<AnkiAudioCard> =
+        runCatching {
+            val raw = context.assets.open("anki_audio/manifest.json").bufferedReader().use { it.readText() }
+            val cards = JSONObject(raw).getJSONArray("cards")
+            buildList {
+                for (index in 0 until cards.length()) {
+                    val item = cards.getJSONObject(index)
+                    add(
+                        AnkiAudioCard(
+                            cardId = item.optLong("cardId"),
+                            noteId = item.optLong("noteId"),
+                            deckName = item.optString("deckName", "Anki"),
+                            category = item.optString("category", item.optString("deckName", "Anki")),
+                            title = item.optString("title", "Anki card"),
+                            answerText = item.optString("answerText"),
+                            spokenText = item.optString("spokenText"),
+                            isDue = item.optBoolean("isDue"),
+                            audioFile = item.optString("audioFile"),
+                            origin = "Bundled export",
+                        )
+                    )
+                }
+            }.filter { card ->
+                card.spokenText.isNotBlank()
+            }
+        }.getOrDefault(emptyList())
+
+    private fun loadAnkiDroidAudioCards(bundledByFile: Map<String, AnkiAudioCard>): List<AnkiAudioCard> {
+        if (!isPackageInstalled(AnkiDroidContract.packageName)) {
+            return emptyList()
+        }
+
+        val deckNames = loadAnkiDroidDeckNames()
+        val allCards = queryAnkiDroidCards("deck:*", deckNames, bundledByFile).associateBy { it.cardId }
+        if (allCards.isEmpty()) return emptyList()
+        val dueIds = queryAnkiDroidCards("is:due", deckNames, bundledByFile).mapTo(mutableSetOf()) { it.cardId }
+        return allCards.values.map { card ->
+            card.copy(isDue = card.cardId in dueIds)
+        }
+    }
+
+    private fun loadAnkiDroidDeckNames(): Map<Long, String> {
+        val projection = arrayOf(AnkiDroidContract.Deck.deckId, AnkiDroidContract.Deck.deckName)
+        return context.contentResolver.query(AnkiDroidContract.decksUri, projection, null, null, null)
+            ?.use { cursor ->
+                buildMap {
+                    while (cursor.moveToNext()) {
+                        put(
+                            cursor.getLong(AnkiDroidContract.Deck.deckId),
+                            cursor.getStringOrBlank(AnkiDroidContract.Deck.deckName),
+                        )
+                    }
+                }
+            }
+            .orEmpty()
+    }
+
+    private fun queryAnkiDroidCards(
+        query: String,
+        deckNames: Map<Long, String>,
+        bundledByFile: Map<String, AnkiAudioCard>,
+    ): List<AnkiAudioCard> {
+        val projection = arrayOf(
+            AnkiDroidContract.Card.id,
+            AnkiDroidContract.Card.noteId,
+            AnkiDroidContract.Card.deckId,
+            AnkiDroidContract.Card.questionSimple,
+            AnkiDroidContract.Card.answerPure,
+        )
+        return context.contentResolver.query(AnkiDroidContract.cardsUri, projection, query, null, null)
+            ?.use { cursor ->
+                buildList {
+                    while (cursor.moveToNext()) {
+                        val answer = cursor.getStringOrBlank(AnkiDroidContract.Card.answerPure)
+                        val syncedAudioFile = extractPodderAudioFile(answer) ?: continue
+                        val bundled = bundledByFile[syncedAudioFile] ?: continue
+                        val deckName = deckNames[cursor.getLong(AnkiDroidContract.Card.deckId)] ?: bundled.deckName
+                        add(
+                            bundled.copy(
+                                cardId = cursor.getLong(AnkiDroidContract.Card.id),
+                                noteId = cursor.getLong(AnkiDroidContract.Card.noteId),
+                                deckName = deckName,
+                                category = deckName.substringBefore("::").ifBlank { deckName },
+                                title = htmlToPlainText(cursor.getStringOrBlank(AnkiDroidContract.Card.questionSimple))
+                                    .ifBlank { bundled.title },
+                                answerText = htmlToPlainText(answer).ifBlank { bundled.answerText },
+                                origin = "AnkiDroid synced collection",
+                            )
+                        )
+                    }
+                }
+            }
+            .orEmpty()
+    }
+
+    private fun scanYoutubeFolder(): List<MediaEntry> {
+        val root = youtubeDirectory()
+        if (!root.exists()) return emptyList()
+        return root.walkTopDown()
+            .filter { it.isFile && MediaSupport.isPlayableExtension(it.extension) }
+            .map { file ->
+                MediaEntry(
+                    uriString = Uri.fromFile(file).toString(),
+                    title = file.nameWithoutExtension.ifBlank { "Untitled" },
+                    folderName = youtubeFolderName,
+                    durationMs = mediaDuration(file),
+                    isVideo = MediaSupport.isVideoUri(file.name),
+                    mimeType = MediaSupport.inferMimeType(file.name),
+                    deletable = true,
+                )
+            }
+            .toList()
+    }
+
+    private fun youtubeDirectory(): File =
+        File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir, youtubeFolderName)
+
+    private fun isPackageInstalled(packageName: String): Boolean =
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(packageName, 0)
+            }
+        }.isSuccess
+
+    private fun mediaDuration(file: File): Long {
+        return runCatching {
+            MediaMetadataRetriever().use { retriever ->
+                retriever.setDataSource(file.absolutePath)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            }
+        }.getOrDefault(0L)
     }
 
     private fun scanIndexedMedia(folder: MediaFolder): List<MediaEntry>? {
@@ -411,21 +640,65 @@ class PlayerRepository(
     private fun encodeFolder(folder: MediaFolder): String = folder.uriString + separator + folder.name
 }
 
+private fun Cursor.getStringOrBlank(column: String): String =
+    getColumnIndex(column).takeIf { it >= 0 }?.let { index ->
+        if (isNull(index)) "" else getString(index).orEmpty()
+    }.orEmpty()
+
+private fun Cursor.getLong(column: String): Long =
+    getColumnIndex(column).takeIf { it >= 0 }?.let { index ->
+        if (isNull(index)) 0L else getLong(index)
+    } ?: 0L
+
+private fun extractPodderAudioFile(answerHtml: String): String? {
+    val match = Regex("""\[sound:podder-([^\]]+)]""").find(answerHtml) ?: return null
+    return match.groupValues[1]
+}
+
+private fun isPackageVisible(context: Context, packageName: String): Boolean =
+    runCatching {
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(packageName, 0)
+        }
+    }.isSuccess
+
+private fun htmlToPlainText(value: String): String =
+    value
+        .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), " ")
+        .replace(Regex("<[^>]+>"), " ")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
 class PlayerViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
+    private val appContext = application.applicationContext
     private val repository = PlayerRepository(application)
-    private val sessionToken = SessionToken(application, ComponentName(application, PlayerService::class.java))
-    private var controllerFuture: ListenableFuture<MediaController>? = null
     private var playerListener: Player.Listener? = null
     private var progressJob: Job? = null
-    private val pendingControllerActions = mutableListOf<(MediaController) -> Unit>()
     private val allMedia = MutableStateFlow<List<MediaEntry>>(emptyList())
     private val folders = MutableStateFlow<List<MediaFolder>>(emptyList())
+    private val ankiCards = MutableStateFlow(AnkiAudioLibrary(emptyList(), "Bundled export"))
     private val query = MutableStateFlow("")
     private val scanning = MutableStateFlow(false)
+    private val youtubeDownloading = MutableStateFlow(false)
+    private val youtubeProgress = MutableStateFlow<Float?>(null)
+    private val youtubeStatus = MutableStateFlow<String?>(null)
     private val playerState = MutableStateFlow(PlayerState())
-    var controller by mutableStateOf<MediaController?>(null)
+    private val isAnkiPlaying = MutableStateFlow(false)
+    private var ankiPlaybackQueue: List<AnkiAudioCard> = emptyList()
+    private var ankiPlaybackIndex: Int = -1
+    private var tts: TextToSpeech? = null
+    var controller by mutableStateOf<ExoPlayer?>(null)
         private set
 
     private val filteredMedia = combine(allMedia, query) { mediaValue, queryValue ->
@@ -439,24 +712,35 @@ class PlayerViewModel(
         }
     }
 
-    private val uiInputs = combine(repository.amoledFlow, repository.resumeFlow, folders) { amoled, resume, foldersValue ->
-        Triple(amoled, resume, foldersValue)
+    private val uiInputs = combine(repository.amoledFlow, repository.resumeFlow, folders, ankiCards) { amoled, resume, foldersValue, ankiLibrary ->
+        AnkiUiInputs(amoled, resume, foldersValue, ankiLibrary)
     }
 
-    private val playbackInputs = combine(filteredMedia, scanning, playerState) { filteredMediaValue, scanningValue, playerValue ->
-        Triple(filteredMediaValue, scanningValue, playerValue)
+    private val youtubeInputs = combine(youtubeDownloading, youtubeProgress, youtubeStatus) { downloading, progress, status ->
+        Triple(downloading, progress, status)
+    }
+
+    private val playbackInputs = combine(filteredMedia, scanning, playerState, youtubeInputs) { filteredMediaValue, scanningValue, playerValue, youtubeValue ->
+        YoutubeUiInputs(filteredMediaValue, scanningValue, playerValue, youtubeValue)
     }
 
     val uiState = combine(uiInputs, playbackInputs) { base, playback ->
-        val (amoled, resume, foldersValue) = base
-        val (filteredMediaValue, scanningValue, playerValue) = playback
+        val (amoled, resume, foldersValue, ankiLibrary) = base
+        val (filteredMediaValue, scanningValue, playerValue, youtubeValue) = playback
         val (queryValue, filtered) = filteredMediaValue
+        val (downloading, progress, status) = youtubeValue
         PlayerUiState(
             amoled = amoled,
             folders = foldersValue,
             media = filtered,
+            ankiCards = ankiLibrary.cards,
+            ankiSource = ankiLibrary.source,
+            ankiError = ankiLibrary.error,
             query = queryValue,
             scanning = scanningValue,
+            youtubeDownloading = downloading,
+            youtubeProgress = progress,
+            youtubeStatus = status,
             resumeState = resume?.takeIf { saved ->
                 allMedia.value.any { it.uriString == saved.uriString } &&
                     saved.positionMs > 5_000L &&
@@ -472,6 +756,27 @@ class PlayerViewModel(
 
     init {
         loadFolders()
+    }
+
+    private fun initTts(context: Context) {
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale.US
+            }
+        }
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                speakNextAnkiCard()
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                speakNextAnkiCard()
+            }
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                speakNextAnkiCard()
+            }
+        })
     }
 
     fun setQuery(value: String) {
@@ -502,7 +807,26 @@ class PlayerViewModel(
         viewModelScope.launch {
             scanning.value = true
             allMedia.value = repository.scanMedia(folders.value)
+            ankiCards.value = repository.loadAnkiAudioCards()
             scanning.value = false
+        }
+    }
+
+    fun refreshAnkiAudio() {
+        viewModelScope.launch {
+            ankiCards.value = repository.loadAnkiAudioCards()
+        }
+    }
+
+    fun deleteMedia(entry: MediaEntry) {
+        viewModelScope.launch {
+            if (repository.deleteMedia(entry)) {
+                if (playerState.value.currentUri == entry.uriString) {
+                    controller?.stop()
+                    repository.clearResume()
+                }
+                rescan()
+            }
         }
     }
 
@@ -510,6 +834,57 @@ class PlayerViewModel(
         val currentList = uiState.value.media
         ensureController { target ->
             playList(currentList, currentList.indexOfFirst { it.uriString == entry.uriString }, 0L, target)
+        }
+    }
+
+    fun playAnkiCards(cards: List<AnkiAudioCard>, startCard: AnkiAudioCard? = null) {
+        stopAnkiPlayback()
+        ensureTts()
+        ankiPlaybackQueue = cards
+        ankiPlaybackIndex = startCard?.let { selected ->
+            cards.indexOfFirst { it.cardId == selected.cardId }
+        }?.coerceAtLeast(0) ?: 0
+        speakCurrentAnkiCard()
+    }
+
+    private fun speakCurrentAnkiCard() {
+        if (ankiPlaybackIndex !in ankiPlaybackQueue.indices) {
+            stopAnkiPlayback()
+            return
+        }
+        val card = ankiPlaybackQueue[ankiPlaybackIndex]
+        val text = card.ttsText()
+        if (text.isBlank()) {
+            ankiPlaybackIndex++
+            speakCurrentAnkiCard()
+            return
+        }
+        isAnkiPlaying.value = true
+        val media = card.asMediaEntry()
+        playerState.value = PlayerState(
+            currentUri = media.uriString,
+            currentTitle = card.title,
+            isPlaying = true,
+            isVideo = false,
+            positionMs = 0L,
+            durationMs = 0L,
+            hasNext = ankiPlaybackIndex < ankiPlaybackQueue.lastIndex,
+            hasPrevious = ankiPlaybackIndex > 0,
+        )
+        val params = android.os.Bundle()
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "anki_${card.cardId}")
+    }
+
+    private fun speakNextAnkiCard() {
+        ankiPlaybackIndex++
+        speakCurrentAnkiCard()
+    }
+
+    private fun stopAnkiPlayback() {
+        tts?.stop()
+        isAnkiPlaying.value = false
+        if (ankiPlaybackQueue.isNotEmpty()) {
+            playerState.value = playerState.value.copy(isPlaying = false)
         }
     }
 
@@ -531,6 +906,10 @@ class PlayerViewModel(
     }
 
     fun togglePlayPause() {
+        if (isAnkiPlaying.value) {
+            stopAnkiPlayback()
+            return
+        }
         ensureController { target ->
             if (target.isPlaying) target.pause() else target.play()
             refreshPlayerState()
@@ -538,6 +917,10 @@ class PlayerViewModel(
     }
 
     fun skipNext() {
+        if (isAnkiPlaying.value) {
+            speakNextAnkiCard()
+            return
+        }
         controller?.let {
             it.seekToNext()
             refreshPlayerState()
@@ -545,6 +928,12 @@ class PlayerViewModel(
     }
 
     fun skipPrevious() {
+        if (isAnkiPlaying.value) {
+            ankiPlaybackIndex = (ankiPlaybackIndex - 1).coerceAtLeast(0)
+            tts?.stop()
+            speakCurrentAnkiCard()
+            return
+        }
         controller?.seekToPrevious()
         refreshPlayerState()
     }
@@ -590,16 +979,10 @@ class PlayerViewModel(
         }
     }
 
-    private fun playList(list: List<MediaEntry>, index: Int, seekMs: Long, target: MediaController) {
+    private fun playList(list: List<MediaEntry>, index: Int, seekMs: Long, target: ExoPlayer) {
         if (index !in list.indices) return
 
-        // Create a safe window of items to avoid Binder Transaction limits
-        val startIndex = maxOf(0, index - 20)
-        val endIndex = minOf(list.size, index + 50) // Load 50 items ahead max
-        val window = list.subList(startIndex, endIndex)
-        val windowIndex = index - startIndex
-
-        val items = window.map { entry ->
+        val items = list.map { entry ->
             MediaItem.Builder()
                 .setMediaId(entry.uriString)
                 .setUri(entry.uriString)
@@ -613,7 +996,7 @@ class PlayerViewModel(
                 .build()
         }
         
-        target.setMediaItems(items, windowIndex, seekMs)
+        target.setMediaItems(items, index, seekMs)
         target.prepare()
         target.play()
         refreshPlayerState()
@@ -626,36 +1009,27 @@ class PlayerViewModel(
         }
     }
 
-    private fun ensureController(onReady: (MediaController) -> Unit) {
-        controller?.let {
-            onReady(it)
+    private fun ensureController(onReady: (ExoPlayer) -> Unit) {
+        controller?.let { existing ->
+            onReady(existing)
             return
         }
-        pendingControllerActions += onReady
-        if (controllerFuture != null) return
-        connectController()
+
+        val target = ExoPlayer.Builder(appContext)
+            .build()
+            .apply {
+                setHandleAudioBecomingNoisy(true)
+                attachListener(this)
+            }
+        controller = target
+        startProgressUpdates()
+        applyPlaybackPrefs(target)
+        onReady(target)
     }
 
-    private fun connectController() {
-        controllerFuture = MediaController.Builder(getApplication(), sessionToken).buildAsync().also { future ->
-            future.addListener(
-                {
-                    val built = runCatching { future.get() }.getOrNull() ?: return@addListener
-                    controllerFuture = null
-                    controller = built
-                    attachListener(built)
-                    refreshPlayerState()
-                    startProgressUpdates()
-                    viewModelScope.launch {
-                        applyPlaybackPrefs(built)
-                    }
-                    pendingControllerActions.toList().forEach { action ->
-                        action(built)
-                    }
-                    pendingControllerActions.clear()
-                },
-                ContextCompat.getMainExecutor(getApplication()),
-            )
+    private fun ensureTts() {
+        if (tts == null) {
+            initTts(appContext)
         }
     }
 
@@ -674,11 +1048,20 @@ class PlayerViewModel(
         }
     }
 
-    private fun attachListener(target: MediaController) {
+    private fun attachListener(target: ExoPlayer) {
         playerListener?.let(target::removeListener)
         playerListener = object : Player.Listener {
             override fun onEvents(player: Player, events: Player.Events) {
                 refreshPlayerState()
+                persistResumeState(player)
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_ENDED) {
+                    viewModelScope.launch {
+                        repository.clearResume()
+                    }
+                }
             }
         }.also(target::addListener)
     }
@@ -701,13 +1084,34 @@ class PlayerViewModel(
         )
     }
 
-    private fun applyPlaybackPrefs(target: MediaController) {
+    private fun applyPlaybackPrefs(target: ExoPlayer) {
         viewModelScope.launch {
             val prefs = repository.getPlaybackPrefs()
             target.playbackParameters = PlaybackParameters(prefs.speed)
             target.shuffleModeEnabled = prefs.shuffleEnabled
             target.repeatMode = prefs.repeatMode
             refreshPlayerState()
+        }
+    }
+
+    private fun persistResumeState(target: Player) {
+        val item = target.currentMediaItem ?: return
+        val duration = target.duration.takeIf { it > 0L } ?: 0L
+        val position = target.currentPosition.coerceAtLeast(0L)
+        viewModelScope.launch {
+            if (duration > 0L && position >= duration - 1_500L) {
+                repository.clearResume()
+            } else {
+                repository.saveResume(
+                    ResumeState(
+                        uriString = item.mediaId,
+                        title = item.mediaMetadata.title?.toString().orEmpty().ifBlank { "Last media" },
+                        positionMs = position,
+                        durationMs = duration,
+                        isVideo = item.localConfiguration?.mimeType?.startsWith("video/") == true,
+                    ),
+                )
+            }
         }
     }
 
@@ -725,10 +1129,11 @@ class PlayerViewModel(
     }
 
     override fun onCleared() {
+        stopAnkiPlayback()
+        tts?.shutdown()
         progressJob?.cancel()
         playerListener?.let { listener -> controller?.removeListener(listener) }
         controller?.release()
-        controllerFuture?.cancel(true)
         super.onCleared()
     }
 }
@@ -740,7 +1145,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+            val uiState by viewModel.uiState.collectAsState()
             val context = LocalContext.current
             val permissionLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestMultiplePermissions(),
@@ -757,6 +1162,9 @@ class MainActivity : ComponentActivity() {
                     } else {
                         add(Manifest.permission.READ_EXTERNAL_STORAGE)
                     }
+                    if (isPackageVisible(context, AnkiDroidContract.packageName)) {
+                        add(AnkiDroidContract.permission)
+                    }
                 }.filter { permission ->
                     ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED
                 }
@@ -768,12 +1176,18 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     PlayerScreen(
                         state = uiState,
-                        controller = viewModel.controller,
-                        onToggleTheme = viewModel::toggleTheme,
                         onQueryChange = viewModel::setQuery,
                         onRefresh = viewModel::rescan,
                         onPlay = viewModel::playFromVisibleList,
+                        onPlayAnkiCards = viewModel::playAnkiCards,
                         onRemoveFolder = viewModel::removeFolder,
+                        onDownloadYoutube = { url ->
+                            val uri = Uri.parse(url.trim())
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                            }
+                        },
+                        onDeleteMedia = viewModel::deleteMedia,
                         onResume = viewModel::resumeSaved,
                         onDismissResume = viewModel::dismissResumePrompt,
                         onTogglePlayPause = viewModel::togglePlayPause,
@@ -796,12 +1210,13 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun PlayerScreen(
     state: PlayerUiState,
-    controller: MediaController?,
-    onToggleTheme: () -> Unit,
     onQueryChange: (String) -> Unit,
     onRefresh: () -> Unit,
     onPlay: (MediaEntry) -> Unit,
+    onPlayAnkiCards: (List<AnkiAudioCard>, AnkiAudioCard?) -> Unit,
     onRemoveFolder: (MediaFolder) -> Unit,
+    onDownloadYoutube: (String) -> Unit,
+    onDeleteMedia: (MediaEntry) -> Unit,
     onResume: () -> Unit,
     onDismissResume: () -> Unit,
     onTogglePlayPause: () -> Unit,
@@ -816,6 +1231,11 @@ private fun PlayerScreen(
 ) {
     val context = LocalContext.current
     var inspectedMedia by remember { mutableStateOf<MediaEntry?>(null) }
+    var youtubeDialogOpen by rememberSaveable { mutableStateOf(false) }
+    var youtubeUrl by rememberSaveable { mutableStateOf("") }
+    var deleteCandidate by remember { mutableStateOf<MediaEntry?>(null) }
+    var collapsedFolders by rememberSaveable { mutableStateOf(setOf<String>()) }
+    var showingAnki by rememberSaveable { mutableStateOf(false) }
     val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri ?: return@rememberLauncherForActivityResult
         val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -826,6 +1246,71 @@ private fun PlayerScreen(
             ?: DocumentsContract.getTreeDocumentId(uri).substringAfterLast(':')
             .ifBlank { "Folder" }
         onFolderPicked(uri, treeName)
+    }
+
+    if (youtubeDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { if (!state.youtubeDownloading) youtubeDialogOpen = false },
+            title = { Text("Open YouTube video") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = youtubeUrl,
+                        onValueChange = { youtubeUrl = it },
+                        singleLine = true,
+                        enabled = !state.youtubeDownloading,
+                        label = { Text("Paste YouTube link") },
+                    )
+                    Text(
+                        "Opens the link outside Podder. Add downloaded files with the folder button.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    state.youtubeStatus?.let {
+                        Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    state.youtubeProgress?.let { progress ->
+                        LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = youtubeUrl.isNotBlank() && !state.youtubeDownloading,
+                    onClick = { onDownloadYoutube(youtubeUrl) },
+                ) {
+                    Text("Open")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !state.youtubeDownloading,
+                    onClick = { youtubeDialogOpen = false },
+                ) {
+                    Text("Close")
+                }
+            },
+        )
+    }
+
+    deleteCandidate?.let { media ->
+        AlertDialog(
+            onDismissRequest = { deleteCandidate = null },
+            title = { Text("Delete video?") },
+            text = { Text("Remove \"${media.title}\" from the YouTube folder.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDeleteMedia(media)
+                    deleteCandidate = null
+                }) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteCandidate = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 
     if (state.resumeState != null) {
@@ -884,9 +1369,9 @@ private fun PlayerScreen(
             CenterAlignedTopAppBar(
                 title = {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("Podcasts", fontWeight = FontWeight.SemiBold)
+                        Text("podder", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "local audio + video",
+                            if (showingAnki) "anki audio" else "local audio + video",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -898,12 +1383,11 @@ private fun PlayerScreen(
                     }
                 },
                 actions = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            if (state.amoled) Icons.Rounded.DarkMode else Icons.Rounded.LightMode,
-                            contentDescription = null,
-                        )
-                        Switch(checked = state.amoled, onCheckedChange = { onToggleTheme() })
+                    IconButton(onClick = { showingAnki = !showingAnki }) {
+                        Icon(Icons.Rounded.School, contentDescription = if (showingAnki) "Show local library" else "Show Anki audio")
+                    }
+                    IconButton(onClick = { youtubeDialogOpen = true }) {
+                        Icon(Icons.Rounded.SmartDisplay, contentDescription = "Download YouTube video")
                     }
                 },
             )
@@ -925,10 +1409,29 @@ private fun PlayerScreen(
         },
         floatingActionButton = {
             FilledIconButton(onClick = { folderLauncher.launch(null) }) {
-                Icon(Icons.Rounded.FolderOpen, contentDescription = "Add folder")
+                Icon(Icons.Rounded.Add, contentDescription = "Add folder")
             }
         },
     ) { padding ->
+        val folderGroups = remember(state.folders, state.media) {
+            val persistedGroups = state.folders.map { folder ->
+                FolderMediaGroup(
+                    folder = folder,
+                    items = state.media.filter { it.folderName == folder.name },
+                )
+            }
+            val knownFolderNames = state.folders.mapTo(mutableSetOf()) { it.name }
+            val virtualGroups = state.media
+                .filter { it.folderName !in knownFolderNames }
+                .groupBy { it.folderName }
+                .map { (name, items) ->
+                    FolderMediaGroup(
+                        folder = MediaFolder("virtual:$name", name),
+                        items = items,
+                    )
+                }
+            virtualGroups + persistedGroups
+        }
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -942,12 +1445,6 @@ private fun PlayerScreen(
                         .padding(horizontal = 16.dp)
                         .statusBarsPadding(),
                 ) {
-                    if (controller != null && state.playerState.isVideo && !LocalInspectionMode.current) {
-                        VideoPlayerPreview(controller = controller)
-                        Spacer(modifier = Modifier.height(12.dp))
-                    }
-                    PlayerHeroCard(state = state, onRefresh = onRefresh)
-                    Spacer(modifier = Modifier.height(12.dp))
                     OutlinedTextField(
                         value = state.query,
                         onValueChange = onQueryChange,
@@ -956,29 +1453,55 @@ private fun PlayerScreen(
                         leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
                         label = { Text("Search tracks or folders") },
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        state.folders.forEach { folder ->
-                            FolderPill(folder = folder, onRemove = { onRemoveFolder(folder) })
-                        }
-                    }
                 }
             }
-            if (state.media.isEmpty()) {
+            if (showingAnki) {
+                item {
+                    AnkiAudioPanel(
+                        cards = state.ankiCards,
+                        source = state.ankiSource,
+                        error = state.ankiError,
+                        playerState = state.playerState,
+                        onPlayAnkiCards = onPlayAnkiCards,
+                    )
+                }
+            } else if (state.media.isEmpty()) {
                 item {
                     EmptyLibraryCard(scanning = state.scanning)
                 }
             } else {
-                itemsIndexed(state.media, key = { _, item -> item.uriString }) { _, item ->
-                    MediaRow(
-                        item = item,
-                        active = state.playerState.currentUri == item.uriString,
-                        onClick = { onPlay(item) },
-                        onLongPress = { inspectedMedia = item },
-                    )
+                folderGroups.forEach { group ->
+                    item(key = "folder-${group.folder.uriString}") {
+                        FolderHeaderRow(
+                            folder = group.folder,
+                            fileCount = group.items.size,
+                            collapsed = group.folder.uriString in collapsedFolders,
+                            removable = !group.folder.uriString.startsWith("virtual:"),
+                            onToggle = {
+                                collapsedFolders = if (group.folder.uriString in collapsedFolders) {
+                                    collapsedFolders - group.folder.uriString
+                                } else {
+                                    collapsedFolders + group.folder.uriString
+                                }
+                            },
+                            onRemove = { onRemoveFolder(group.folder) },
+                        )
+                    }
+                    if (group.folder.uriString !in collapsedFolders) {
+                        itemsIndexed(group.items, key = { _, item -> item.uriString }) { _, item ->
+                            MediaRow(
+                                item = item,
+                                active = state.playerState.currentUri == item.uriString,
+                                onClick = { onPlay(item) },
+                                onLongPress = { inspectedMedia = item },
+                                onDelete = if (item.deletable) {
+                                    { deleteCandidate = item }
+                                } else {
+                                    null
+                                },
+                            )
+                        }
+                    }
                 }
             }
             item {
@@ -988,116 +1511,233 @@ private fun PlayerScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun PlayerHeroCard(
-    state: PlayerUiState,
-    onRefresh: () -> Unit,
+private fun AnkiAudioPanel(
+    cards: List<AnkiAudioCard>,
+    source: String,
+    error: String?,
+    playerState: PlayerState,
+    onPlayAnkiCards: (List<AnkiAudioCard>, AnkiAudioCard?) -> Unit,
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    var dueOnly by rememberSaveable { mutableStateOf(true) }
+    var selectedCategory by rememberSaveable { mutableStateOf<String?>(null) }
+    val categories = remember(cards) { cards.map { it.category }.distinct().sorted() }
+    val filteredCards = remember(cards, dueOnly, selectedCategory) {
+        cards.filter { card ->
+            (!dueOnly || card.isDue) && (selectedCategory == null || card.category == selectedCategory)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(
-                    Brush.linearGradient(
-                        listOf(
-                            MaterialTheme.colorScheme.surface,
-                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f),
-                        ),
-                    ),
-                )
-                .padding(horizontal = 14.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Top,
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Library", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        if (state.playerState.currentUri != null) state.playerState.currentTitle else "Compact local playback",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Anki audio", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "$source • ${filteredCards.size} selected • ${cards.count { it.isDue }} due today • ${cards.size} total",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = dueOnly, onCheckedChange = { dueOnly = it })
+                }
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AssistChip(
+                        onClick = { selectedCategory = null },
+                        label = { Text("All") },
+                        leadingIcon = if (selectedCategory == null) {
+                            { Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary)) }
+                        } else null,
                     )
+                    categories.forEach { category ->
+                        AssistChip(
+                            onClick = { selectedCategory = category },
+                            label = { Text(category) },
+                            leadingIcon = if (selectedCategory == category) {
+                                { Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary)) }
+                            } else null,
+                        )
+                    }
+                }
+                error?.let {
                     Text(
-                        if (state.playerState.currentUri != null) {
-                            "${MediaSupport.displayKind(state.playerState.currentUri)} • ${if (state.playerState.isPlaying) "playing" else "paused"}"
-                        } else {
-                            "MP3 and MP4 folders, background play, saved resume"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AssistChip(onClick = onRefresh, label = { Text("Rescan") })
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AssistChip(
+                        enabled = filteredCards.isNotEmpty(),
+                        onClick = { onPlayAnkiCards(filteredCards, null) },
+                        label = { Text("Play selected") },
+                        leadingIcon = { Icon(Icons.Rounded.PlayArrow, contentDescription = null) },
+                    )
+                    if (selectedCategory != null) {
+                        AssistChip(
+                            enabled = filteredCards.isNotEmpty(),
+                            onClick = { onPlayAnkiCards(filteredCards, null) },
+                            label = { Text("Play category") },
+                            leadingIcon = { Icon(Icons.Rounded.PlayCircle, contentDescription = null) },
+                        )
+                    }
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                CompactStat(label = "folders", value = state.folders.size.toString(), modifier = Modifier.weight(1f))
-                CompactStat(label = "files", value = state.media.size.toString(), modifier = Modifier.weight(1f))
-                CompactStat(label = "theme", value = if (state.amoled) "amoled" else "white", modifier = Modifier.weight(1f))
-                CompactStat(label = "scan", value = if (state.scanning) "busy" else "ready", modifier = Modifier.weight(1f))
+        }
+
+        if (cards.isEmpty()) {
+            EmptyAnkiCard()
+        } else if (filteredCards.isEmpty()) {
+            Text(
+                "No cards match the current Anki audio filters.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(12.dp),
+            )
+        } else {
+            filteredCards.forEach { card ->
+                AnkiAudioRow(
+                    card = card,
+                    active = playerState.currentUri == card.asMediaEntry().uriString,
+                    onClick = { onPlayAnkiCards(filteredCards, card) },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun CompactStat(
-    label: String,
-    value: String,
-    modifier: Modifier = Modifier,
-) {
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(18.dp))
-            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.55f))
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(18.dp))
-            .padding(horizontal = 10.dp, vertical = 10.dp),
+private fun EmptyAnkiCard() {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {
-        Text(value, fontWeight = FontWeight.Bold)
-        Text(
-            label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("No exported Anki audio", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Sync AnkiDroid and grant Podder AnkiDroid access, or run scripts/export_anki_audio.py while Anki Desktop is open.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
 @Composable
-private fun FolderPill(
+private fun AnkiAudioRow(
+    card: AnkiAudioCard,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = if (active) {
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.9f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            },
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        if (active) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (active) Icons.Rounded.PauseCircle else Icons.Rounded.School,
+                    contentDescription = null,
+                    tint = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(card.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                Text(
+                    card.answerText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "${card.deckName} • ${if (card.isDue) "due today" else "not due"}",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Icon(Icons.Rounded.PlayCircle, contentDescription = "Play Anki card")
+        }
+    }
+}
+
+@Composable
+private fun FolderHeaderRow(
     folder: MediaFolder,
+    fileCount: Int,
+    collapsed: Boolean,
+    removable: Boolean,
+    onToggle: () -> Unit,
     onRemove: () -> Unit,
 ) {
     Surface(
-        shape = RoundedCornerShape(18.dp),
-        tonalElevation = 2.dp,
+        shape = RoundedCornerShape(20.dp),
         color = MaterialTheme.colorScheme.surface,
-        modifier = Modifier.border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(18.dp)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(20.dp))
+            .clickable(onClick = onToggle),
     ) {
         Row(
-            modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+            modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(folder.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            FilledIconButton(
-                onClick = onRemove,
-                modifier = Modifier.size(26.dp),
-                shape = CircleShape,
-            ) {
-                Icon(Icons.Rounded.DeleteOutline, contentDescription = "Remove folder", modifier = Modifier.size(14.dp))
+            Text(if (collapsed) "+" else "-", style = MaterialTheme.typography.titleMedium)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(folder.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "$fileCount files",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (removable) {
+                FilledIconButton(
+                    onClick = onRemove,
+                    modifier = Modifier.size(26.dp),
+                    shape = CircleShape,
+                ) {
+                    Icon(Icons.Rounded.DeleteOutline, contentDescription = "Remove folder", modifier = Modifier.size(14.dp))
+                }
             }
         }
     }
@@ -1144,6 +1784,7 @@ private fun MediaRow(
     active: Boolean,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
+    onDelete: (() -> Unit)?,
 ) {
     Card(
         modifier = Modifier
@@ -1194,12 +1835,23 @@ private fun MediaRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Column(horizontalAlignment = Alignment.End) {
-                Icon(
-                    if (active) Icons.Rounded.PauseCircle else Icons.Rounded.PlayCircle,
-                    contentDescription = null,
-                    tint = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (onDelete != null) {
+                    IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            Icons.Rounded.DeleteOutline,
+                            contentDescription = "Delete YouTube video",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    Icon(
+                        if (active) Icons.Rounded.PauseCircle else Icons.Rounded.PlayCircle,
+                        contentDescription = null,
+                        tint = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Text(
                     if (item.isVideo) "video" else "audio",
                     style = MaterialTheme.typography.labelSmall,
@@ -1207,30 +1859,6 @@ private fun MediaRow(
                 )
             }
         }
-    }
-}
-
-@Composable
-private fun VideoPlayerPreview(controller: MediaController) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(210.dp)
-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(28.dp)),
-        shape = RoundedCornerShape(28.dp),
-    ) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { context ->
-                PlayerView(context).apply {
-                    player = controller
-                    useController = false
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
-                }
-            },
-            update = { it.player = controller },
-        )
     }
 }
 

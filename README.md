@@ -13,6 +13,7 @@
 - Includes quick seek controls for `-15s`, `-5s`, `+5s`, and `+15s`
 - Supports playback speed, shuffle, and repeat controls
 - Lets you long-press a library row to inspect the full title and media details
+- Includes an Anki audio screen backed by generated card narration
 
 ## UI Notes
 
@@ -20,13 +21,34 @@
 - White / AMOLED theme toggle
 - Single add-folder action in the bottom-right FAB
 - Search field for filtering tracks and folders
+- School icon switches between local media and Anki audio
+
+## Anki Audio
+
+Generate and sync narrated Anki cards from this workstation while Anki Desktop is open:
+
+```bash
+python3 scripts/export_anki_audio.py --query 'deck:*' --jobs 4 --embed-in-anki --sync
+./gradlew :app:assembleDebug
+```
+
+The exporter uses AnkiConnect read/update/media endpoints only. It does not answer
+cards or call review endpoints, so listening in Podder does not mark cards as
+reviewed. Japanese `japadict` cards are spoken as `The meaning of [word] is
+[translation].`
+
+On Android, Podder first tries to read the synced AnkiDroid collection through
+AnkiDroid's content provider using `deck:*` and `is:due` searches. It only uses
+read-only provider queries and maps synced `podder-*` sound tags back to the
+bundled audio assets. If AnkiDroid is not installed or permission is not
+granted, Podder falls back to the bundled export manifest.
 
 ## Tech
 
 - Kotlin
 - Jetpack Compose
 - AndroidX Media3
-- DataStore
+- SharedPreferences
 - DocumentFile + MediaStore
 
 ## Build
