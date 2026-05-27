@@ -1589,7 +1589,7 @@ private fun AnkiAudioPanel(
     playerState: PlayerState,
     onPlayAnkiCards: (List<AnkiAudioCard>, AnkiAudioCard?) -> Unit,
 ) {
-    var dueOnly by rememberSaveable { mutableStateOf(true) }
+    var dueOnly by rememberSaveable { mutableStateOf(false) }
     var selectedCategory by rememberSaveable { mutableStateOf<String?>(null) }
     val categories = remember(cards) { cards.map { it.category }.distinct().sorted() }
     val filteredCards = remember(cards, dueOnly, selectedCategory) {
@@ -1618,6 +1618,12 @@ private fun AnkiAudioPanel(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    Text(
+                        "Due",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(end = 8.dp),
+                    )
                     Switch(checked = dueOnly, onCheckedChange = { dueOnly = it })
                 }
                 FlowRow(
