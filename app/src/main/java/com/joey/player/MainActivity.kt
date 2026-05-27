@@ -113,6 +113,9 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.joey.player.domain.MediaSupport
 import com.joey.player.ui.theme.SlatePlayerTheme
+import com.yausername.ffmpeg.FFmpeg
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
@@ -380,6 +383,37 @@ class PlayerRepository(
         }
     }
 
+    suspend fun downloadYoutube(url: String, onProgress: (Float?, String) -> Unit): File = withContext(Dispatchers.IO) {
+        val cleanUrl = url.trim()
+        require(cleanUrl.isNotBlank()) { "Paste a YouTube URL first." }
+
+        val outputDir = youtubeDirectory().apply { mkdirs() }
+        onProgress(null, "Preparing yt-dlp...")
+        YoutubeDL.getInstance().init(context)
+        FFmpeg.getInstance().init(context)
+
+        val request = YoutubeDLRequest(cleanUrl).apply {
+            addOption("--no-playlist")
+            addOption("--restrict-filenames")
+            addOption("-f", "bv*+ba/best")
+            addOption("--merge-output-format", "mp4")
+            addOption("-o", File(outputDir, "%(title).180B-%(id)s.%(ext)s").absolutePath)
+        }
+
+        YoutubeDL.getInstance().execute(request, null, false) { progress, _, line ->
+            val normalizedProgress = progress.takeIf { it >= 0f }?.let { (it / 100f).coerceIn(0f, 1f) }
+            onProgress(normalizedProgress, line.ifBlank { "Downloading..." })
+        }
+
+        scanYoutubeFolder().maxByOrNull { File(Uri.parse(it.uriString).path.orEmpty()).lastModified() }
+            ?.let { File(Uri.parse(it.uriString).path.orEmpty()) }
+            ?.takeIf { it.isFile }
+            ?: outputDir.listFiles()
+                ?.filter { it.isFile && MediaSupport.isPlayableExtension(it.extension) }
+                ?.maxByOrNull { it.lastModified() }
+            ?: error("Download finished but no playable file was found.")
+    }
+
     suspend fun scanMedia(folders: List<MediaFolder>): List<MediaEntry> = withContext(Dispatchers.IO) {
         val folderMedia = folders.flatMap { folder ->
             scanIndexedMedia(folder) ?: run {
@@ -391,7 +425,6 @@ class PlayerRepository(
     }
 
     suspend fun loadAnkiAudioCards(): AnkiAudioLibrary = withContext(Dispatchers.IO) {
-        val bundled = loadBundledAnkiAudioCards()
         val liveResult = runCatching { loadAnkiDroidAudioCards() }
         liveResult.getOrNull()?.takeIf { it.isNotEmpty() }?.let { liveCards ->
             return@withContext AnkiAudioLibrary(
@@ -399,6 +432,15 @@ class PlayerRepository(
                 source = "AnkiDroid synced collection",
             )
         }
+        val imported = loadImportedAnkiAudioCards()
+        if (imported.isNotEmpty()) {
+            return@withContext AnkiAudioLibrary(
+                cards = imported.sortedWith(compareBy(AnkiAudioCard::category, AnkiAudioCard::title)),
+                source = "Imported Anki audio folder",
+                error = liveResult.exceptionOrNull()?.message,
+            )
+        }
+        val bundled = loadBundledAnkiAudioCards()
         AnkiAudioLibrary(
             cards = bundled,
             source = "Bundled export",
@@ -406,34 +448,70 @@ class PlayerRepository(
         )
     }
 
+    private suspend fun loadImportedAnkiAudioCards(): List<AnkiAudioCard> {
+        val folders = getFolders()
+        return folders.firstNotNullOfOrNull { folder ->
+            val root = DocumentFile.fromTreeUri(context, Uri.parse(folder.uriString)) ?: return@firstNotNullOfOrNull null
+            val audioRoot = findAnkiAudioRoot(root) ?: return@firstNotNullOfOrNull null
+            loadAnkiAudioCardsFromDocumentRoot(audioRoot)
+                .takeIf { it.isNotEmpty() }
+        }.orEmpty()
+    }
+
+    private fun findAnkiAudioRoot(root: DocumentFile): DocumentFile? {
+        if (root.findFile("manifest.json")?.isFile == true) return root
+        return root.findFile("anki_audio")?.takeIf { it.isDirectory && it.findFile("manifest.json")?.isFile == true }
+    }
+
+    private fun loadAnkiAudioCardsFromDocumentRoot(root: DocumentFile): List<AnkiAudioCard> =
+        runCatching {
+            val manifest = root.findFile("manifest.json") ?: return@runCatching emptyList()
+            val raw = context.contentResolver.openInputStream(manifest.uri)?.bufferedReader()?.use { it.readText() }
+                ?: return@runCatching emptyList()
+            val filesByName = root.listFiles().filter { it.isFile }.associateBy { it.name.orEmpty() }
+            parseAnkiAudioManifest(raw) { audioFile ->
+                filesByName[audioFile]?.uri?.toString()
+            }.map {
+                it.copy(origin = "Imported Anki audio folder")
+            }
+        }.getOrDefault(emptyList())
+
     private fun loadBundledAnkiAudioCards(): List<AnkiAudioCard> =
         runCatching {
             val raw = context.assets.open("anki_audio/manifest.json").bufferedReader().use { it.readText() }
-            val cards = JSONObject(raw).getJSONArray("cards")
-            buildList {
-                for (index in 0 until cards.length()) {
-                    val item = cards.getJSONObject(index)
-                    add(
-                        AnkiAudioCard(
-                            cardId = item.optLong("cardId"),
-                            noteId = item.optLong("noteId"),
-                            deckName = item.optString("deckName", "Anki"),
-                            category = item.optString("category", item.optString("deckName", "Anki")),
-                            title = item.optString("title", "Anki card"),
-                            answerText = item.optString("answerText"),
-                            spokenText = item.optString("spokenText"),
-                            isDue = item.optBoolean("isDue"),
-                            audioFile = item.optString("audioFile"),
-                            ankiMediaFile = item.optString("audioFile").takeIf { it.isNotBlank() }?.let { "podder-$it" }.orEmpty(),
-                            audioUriString = bundledAssetUri(item.optString("audioFile")).orEmpty(),
-                            origin = "Bundled export",
-                        )
-                    )
-                }
-            }.filter { card ->
-                card.audioUriString.isNotBlank()
-            }
+            parseAnkiAudioManifest(raw, ::bundledAssetUri).map { it.copy(origin = "Bundled export") }
         }.getOrDefault(emptyList())
+
+    private fun parseAnkiAudioManifest(
+        raw: String,
+        resolveAudioUri: (String) -> String?,
+    ): List<AnkiAudioCard> {
+        val cards = JSONObject(raw).getJSONArray("cards")
+        return buildList {
+            for (index in 0 until cards.length()) {
+                val item = cards.getJSONObject(index)
+                val audioFile = item.optString("audioFile")
+                val audioUri = resolveAudioUri(audioFile).orEmpty()
+                if (audioUri.isBlank()) continue
+                add(
+                    AnkiAudioCard(
+                        cardId = item.optLong("cardId"),
+                        noteId = item.optLong("noteId"),
+                        deckName = item.optString("deckName", "Anki"),
+                        category = item.optString("category", item.optString("deckName", "Anki")),
+                        title = item.optString("title", "Anki card"),
+                        answerText = item.optString("answerText"),
+                        spokenText = item.optString("spokenText"),
+                        isDue = item.optBoolean("isDue"),
+                        audioFile = audioFile,
+                        ankiMediaFile = audioFile.takeIf { it.isNotBlank() }?.let { "podder-$it" }.orEmpty(),
+                        audioUriString = audioUri,
+                        origin = "",
+                    )
+                )
+            }
+        }
+    }
 
     private fun loadAnkiDroidAudioCards(): List<AnkiAudioCard> {
         if (!isPackageInstalled(AnkiDroidContract.packageName)) {
@@ -863,6 +941,29 @@ class PlayerViewModel(
         }
     }
 
+    fun downloadYoutube(url: String) {
+        if (youtubeDownloading.value) return
+        viewModelScope.launch {
+            youtubeDownloading.value = true
+            youtubeProgress.value = null
+            youtubeStatus.value = "Starting download..."
+            runCatching {
+                repository.downloadYoutube(url) { progress, status ->
+                    youtubeProgress.value = progress
+                    youtubeStatus.value = status.ifBlank { "Downloading..." }
+                }
+            }.onSuccess { file ->
+                youtubeProgress.value = 1f
+                youtubeStatus.value = "Saved ${file.name}"
+                rescan()
+            }.onFailure { error ->
+                youtubeProgress.value = null
+                youtubeStatus.value = error.message ?: "Download failed."
+            }
+            youtubeDownloading.value = false
+        }
+    }
+
     fun playFromVisibleList(entry: MediaEntry) {
         val currentList = uiState.value.media
         ensureController { target ->
@@ -1154,12 +1255,7 @@ class MainActivity : ComponentActivity() {
                         onPlay = viewModel::playFromVisibleList,
                         onPlayAnkiCards = viewModel::playAnkiCards,
                         onRemoveFolder = viewModel::removeFolder,
-                        onDownloadYoutube = { url ->
-                            val uri = Uri.parse(url.trim())
-                            runCatching {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, uri))
-                            }
-                        },
+                        onDownloadYoutube = viewModel::downloadYoutube,
                         onDeleteMedia = viewModel::deleteMedia,
                         onResume = viewModel::resumeSaved,
                         onDismissResume = viewModel::dismissResumePrompt,
@@ -1235,7 +1331,7 @@ private fun PlayerScreen(
                         label = { Text("Paste YouTube link") },
                     )
                     Text(
-                        "Opens the link outside Podder. Add downloaded files with the folder button.",
+                        "Downloads into Podder's YouTube folder.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     state.youtubeStatus?.let {
@@ -1251,7 +1347,7 @@ private fun PlayerScreen(
                     enabled = youtubeUrl.isNotBlank() && !state.youtubeDownloading,
                     onClick = { onDownloadYoutube(youtubeUrl) },
                 ) {
-                    Text("Open")
+                    Text("Download")
                 }
             },
             dismissButton = {
@@ -1603,7 +1699,7 @@ private fun EmptyAnkiCard() {
         ) {
             Text("No exported Anki audio", fontWeight = FontWeight.SemiBold)
             Text(
-                "Sync AnkiDroid and grant Podder AnkiDroid access, or run scripts/export_anki_audio.py while Anki Desktop is open.",
+                "Add the exported anki_audio folder with the folder button, then refresh. AnkiDroid live access is optional.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
