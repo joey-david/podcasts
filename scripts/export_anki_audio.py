@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import re
@@ -33,7 +34,7 @@ PODDER_AUDIO_RE = re.compile(
     r"\s*<div class=['\"]podder-audio['\"]>\[sound:[^\]]+\]</div>\s*",
     flags=re.I,
 )
-LATEX_MARKER_RE = re.compile(r"(\[/?\$\$]|\$\$|\\\(|\\\[|\\[A-Za-z]+|[_^{}]|[=<>∑∫√∞λσμπ≈≤≥])")
+LATEX_MARKER_RE = re.compile(r"(\[/?(?:latex|\$\$)]|\$\$|\\\(|\\\[|\\[A-Za-z]+|[_^{}]|[=<>∑∫√∞λσμπ≈≤≥])")
 WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
 
@@ -105,6 +106,19 @@ def anki_invoke(action: str, **params):
     return body.get("result")
 
 
+def anki_invoke_retry(action: str, **params):
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            return anki_invoke(action, **params)
+        except Exception as exc:
+            last_error = exc
+            if attempt == 4:
+                break
+            time.sleep(attempt)
+    raise RuntimeError(f"{action} failed after retries: {last_error}") from last_error
+
+
 def clean_text(value: str) -> str:
     value = html.unescape(value or "")
     value = PODDER_AUDIO_RE.sub(" ", value)
@@ -140,7 +154,11 @@ def formula_density(raw_html: str, clean: str) -> float:
 
 
 def looks_formula_heavy(raw_html: str, clean: str) -> bool:
-    if re.search(r"(\[\$\$]|\[/\$\$]|\$\$|\\frac|\\sum|\\int|\\sqrt|\\begin|\\end)", raw_html or "", re.I):
+    if re.search(r"(\[/?latex]|\[\$\$]|\[/\$\$]|\$\$|\\frac|\\sum|\\int|\\sqrt|\\begin|\\end)", raw_html or "", re.I):
+        return True
+    if re.search(r"\s(?:=|<=|>=|≈|≤|≥)\s|\w(?:=|<=|>=|≈|≤|≥)\w", clean or ""):
+        return True
+    if re.search(r"\b(formula|equation)\b", clean or "", re.I) and re.search(r"[=<>^_{}\\]|\\[A-Za-z]+", raw_html or clean):
         return True
     symbol_count = len(re.findall(r"[=<>^_{}\\+\-*/|∑∫√∞≈≤≥]", raw_html or clean))
     word_count = len(WORD_RE.findall(clean))
@@ -177,27 +195,34 @@ def make_spoken_text(
     japanese_voice: str,
 ) -> tuple[str, str, str, list[dict[str, str]], str, str]:
     front_text = div_text(front_html, "japadict-front") or html_to_text(front_html)
+    reading = div_text(back_html, "japadict-reading") or div_text(front_html, "japadict-front-reading") or ""
     meaning = div_text(back_html, "japadict-meaning")
+    explicit_audio = div_text(back_html, "podder-audio-text") or div_text(front_html, "podder-audio-text")
     back_text = meaning or html_to_text(back_html)
 
     if "japanese" in deck_name.lower() or meaning:
         word = front_text
+        spoken_word = reading or word
         translation = meaning or back_text
-        spoken = f"The meaning of {word} is {translation}."
+        title = f"{word} ({reading})" if reading and reading != word else word
+        japanese_prompt = f"「{spoken_word}」の意味は"
+        spoken = f"{japanese_prompt} {translation}."
         segments = [
-            {"voice": english_voice, "text": "The meaning of"},
-            {"voice": japanese_voice, "text": word},
-            {"voice": english_voice, "text": f"is {translation}."},
+            {"voice": japanese_voice, "text": japanese_prompt},
+            {"voice": english_voice, "text": f"{translation}."},
         ]
-        return word, translation, spoken, segments, "nice", "Japanese word plus translation"
+        return title, translation, spoken, segments, "nice", "Japanese kana prompt plus English translation"
 
     title = front_text
     front_formula = looks_formula_heavy(front_html, front_text)
     back_formula = looks_formula_heavy(back_html, back_text)
     unfriendly, reason = looks_audio_unfriendly(front_html + "\n" + back_html, f"{front_text} {back_text}")
+    if explicit_audio:
+        spoken = explicit_audio
+        return title, back_text, spoken, [{"voice": english_voice, "text": spoken}], "conceptual", "explicit readable audio text"
     if front_formula or back_formula:
         spoken = conceptual_formula_audio(front_text, back_text)
-        return title, back_text, spoken, [{"voice": english_voice, "text": spoken}], "conceptual", "formula-heavy card narrated conceptually"
+        return title, back_text, spoken, [], "not_nice", "formula-heavy card has no explicit readable audio text"
     if unfriendly:
         spoken = f"{front_text}."
         return title, back_text, spoken, [], "not_nice", reason
@@ -259,6 +284,7 @@ def collect_cards(query: str, limit: int | None, english_voice: str, japanese_vo
 
 def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) -> None:
     updated = 0
+    removed = 0
     skipped = 0
     seen_notes: set[int] = set()
     for index, card in enumerate(cards, start=1):
@@ -266,7 +292,21 @@ def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) ->
             continue
         seen_notes.add(card.note_id)
         if not card.tts_segments:
-            skipped += 1
+            clean_back = PODDER_AUDIO_RE.sub("", card.back_html).strip()
+            if clean_back != card.back_html:
+                anki_invoke_retry(
+                    "updateNoteFields",
+                    note={
+                        "id": card.note_id,
+                        "fields": {
+                            "Back": clean_back,
+                        },
+                    },
+                )
+                removed += 1
+                print(f"[{index}/{len(cards)}] removed Podder audio from {card.title}")
+            else:
+                skipped += 1
             continue
         audio_path = output_dir / card.audio_file
         if not audio_path.exists() or audio_path.stat().st_size == 0:
@@ -280,11 +320,11 @@ def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) ->
 
         for attempt in range(1, 4):
             try:
-                anki_invoke("storeMediaFile", filename=media_name, data=encoded)
+                anki_invoke_retry("storeMediaFile", filename=media_name, data=encoded)
                 if next_back == card.back_html:
                     skipped += 1
                 else:
-                    anki_invoke(
+                    anki_invoke_retry(
                         "updateNoteFields",
                         note={
                             "id": card.note_id,
@@ -302,7 +342,7 @@ def embed_audio_in_anki(cards: list[CardAudio], output_dir: Path, sync: bool) ->
                 print(f"[{index}/{len(cards)}] retry {attempt} after {exc}", file=sys.stderr)
                 time.sleep(attempt)
         time.sleep(0.02)
-    print(f"Embedded audio into {updated} Anki notes; skipped {skipped} already-linked notes")
+    print(f"Embedded audio into {updated} Anki notes; removed {removed} audio tags; skipped {skipped} already-linked notes")
     if sync:
         anki_invoke("sync")
         print("Triggered Anki sync")
@@ -355,6 +395,38 @@ def concat_mp3(parts: list[Path], target: Path) -> None:
         list_path.unlink(missing_ok=True)
 
 
+def tts_signature(card: CardAudio) -> str:
+    payload = json.dumps(
+        {"schemaVersion": 1, "segments": card.tts_segments},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def tts_is_current(card: CardAudio, output_dir: Path) -> bool:
+    target = output_dir / card.audio_file
+    meta = target.with_suffix(target.suffix + ".json")
+    if not target.exists() or target.stat().st_size == 0 or not meta.exists():
+        return False
+    try:
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return payload.get("signature") == tts_signature(card)
+
+
+def write_tts_meta(card: CardAudio, output_dir: Path) -> None:
+    target = output_dir / card.audio_file
+    meta = target.with_suffix(target.suffix + ".json")
+    payload = {"signature": tts_signature(card), "segments": card.tts_segments}
+    meta.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 async def synthesize_one(card: CardAudio, output_dir: Path, index: int, total: int) -> None:
     target = output_dir / card.audio_file
     if len(card.tts_segments) == 1:
@@ -368,6 +440,7 @@ async def synthesize_one(card: CardAudio, output_dir: Path, index: int, total: i
                 await save_tts(segment["text"], segment["voice"], part)
                 parts.append(part)
             concat_mp3(parts, target)
+    write_tts_meta(card, output_dir)
     print(f"[{index}/{total}] {target.name}")
 
 
@@ -383,7 +456,7 @@ async def synthesize(cards: list[CardAudio], output_dir: Path, force: bool, jobs
         (index, card)
         for index, card in enumerate(cards, start=1)
         if card.tts_segments
-        and (force or not (output_dir / card.audio_file).exists() or (output_dir / card.audio_file).stat().st_size == 0)
+        and (force or not tts_is_current(card, output_dir))
     ]
     semaphore = asyncio.Semaphore(jobs)
 
@@ -392,6 +465,18 @@ async def synthesize(cards: list[CardAudio], output_dir: Path, force: bool, jobs
             await synthesize_one(card, output_dir, index, len(cards))
 
     await asyncio.gather(*(run(index, card) for index, card in missing))
+
+
+def prune_stale_audio(cards: list[CardAudio], output_dir: Path) -> None:
+    playable = {card.audio_file for card in cards if card.tts_segments}
+    for path in output_dir.glob("*.mp3"):
+        if path.name not in playable:
+            path.unlink()
+            path.with_suffix(path.suffix + ".json").unlink(missing_ok=True)
+    for path in output_dir.glob("*.mp3.json"):
+        audio_name = path.name.removesuffix(".json")
+        if audio_name not in playable:
+            path.unlink()
 
 
 def write_manifest(cards: list[CardAudio], output_dir: Path, query: str, voice: str, japanese_voice: str) -> None:
@@ -442,6 +527,7 @@ def main() -> int:
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     cards = collect_cards(args.query, args.limit, args.voice, args.japanese_voice)
+    prune_stale_audio(cards, args.output)
     write_manifest(cards, args.output, args.query, args.voice, args.japanese_voice)
     print(f"Wrote {len(cards)} manifest entries to {args.output / 'manifest.json'}")
     if not args.manifest_only:
