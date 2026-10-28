@@ -1,1 +1,1 @@
-# Intentionally empty for the first build.
+# Media3/Compose ship their own consumer rules.

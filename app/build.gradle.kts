@@ -2,7 +2,7 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 val keystoreProperties = Properties().apply {
@@ -20,14 +20,18 @@ val hasReleaseSigning =
 
 android {
     namespace = "com.joey.player"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.joey.player"
         minSdk = 29
-        targetSdk = 35
-        versionCode = 7
-        versionName = "1.0.6"
+        targetSdk = 36
+        versionCode = 8
+        versionName = "2.0.0"
+    }
+
+    androidResources {
+        localeFilters += listOf("en")
     }
 
     signingConfigs {
@@ -60,54 +64,46 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
-        buildConfig = false
-    }
-
-    sourceSets {
-        getByName("main") {
-            assets.srcDir(rootProject.file("generated"))
-        }
-    }
-
-    composeOptions {
-        kotlinCompilerExtensionVersion = libs.versions.composeCompiler.get()
     }
 
     packaging {
-        jniLibs {
+        // Compressed dex keeps the download small; the app is tiny enough that install-time extraction is free.
+        dex {
             useLegacyPackaging = true
         }
         resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += listOf(
+                "/META-INF/**",
+                "/kotlin/**",
+                "DebugProbesKt.bin",
+                "/*.properties",
+            )
         }
+    }
+
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
 }
 
 dependencies {
     implementation(platform(libs.compose.bom))
     implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
     implementation(libs.compose.ui)
-    implementation(libs.compose.ui.graphics)
-    implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
     implementation(libs.compose.foundation)
-    implementation(libs.compose.runtime)
     implementation(libs.compose.material.icons)
     implementation(libs.androidx.documentfile)
     implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.session)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.youtubedl.android.library)
-    implementation(libs.youtubedl.android.ffmpeg)
+    implementation(libs.kotlinx.coroutines.guava)
     debugImplementation(libs.compose.ui.tooling)
-    debugImplementation(libs.compose.ui.test.manifest)
+    testImplementation(libs.junit)
 }
