@@ -26,8 +26,8 @@ android {
         applicationId = "com.joey.player"
         minSdk = 29
         targetSdk = 36
-        versionCode = 8
-        versionName = "2.0.0"
+        versionCode = 9
+        versionName = "2.0.1"
     }
 
     androidResources {
