@@ -37,6 +37,7 @@ class YouTubeDownloader(private val outputDir: File) {
         val bitrate: Int,
         val height: Int,
         val contentLength: Long,
+        val drc: Boolean,
     )
 
     private data class PlayerInfo(
@@ -54,7 +55,7 @@ class YouTubeDownloader(private val outputDir: File) {
             val base = "${sanitize(info.title)}-$videoId"
             val audio = info.streams
                 .filter { it.mimeType.startsWith("audio/mp4") }
-                .maxByOrNull { it.bitrate }
+                .maxWithOrNull(compareBy<Stream> { !it.drc }.thenBy { it.bitrate })
                 ?: error("No downloadable audio stream for this video.")
 
             val result = when (mode) {
@@ -94,8 +95,9 @@ class YouTubeDownloader(private val outputDir: File) {
 
     private fun fetchPlayer(videoId: String): PlayerInfo {
         var lastReason = "YouTube refused the request."
+        val visitorData = runCatching { fetchVisitorData() }.getOrNull()
         for (client in clients) {
-            val response = runCatching { postPlayer(client, videoId) }.getOrElse {
+            val response = runCatching { postPlayer(client, videoId, visitorData) }.getOrElse {
                 lastReason = it.message ?: lastReason
                 null
             } ?: continue
@@ -119,23 +121,65 @@ class YouTubeDownloader(private val outputDir: File) {
                                 bitrate = format.optInt("bitrate"),
                                 height = format.optInt("height"),
                                 contentLength = format.optString("contentLength").toLongOrNull() ?: 0L,
+                                drc = format.optBoolean("isDrc") || isDrcXtags(format.optString("xtags")),
                             ),
                         )
                     }
                 }
             }
             if (streams.isEmpty()) continue
+            // Clients that need a PO token serve the first ~1 MB and then 403, so check deep inside the file.
+            val probe = streams.filter { it.mimeType.startsWith("audio/mp4") }.maxByOrNull { it.bitrate }
+            if (probe != null && !canReadDeep(probe, client)) {
+                lastReason = "YouTube blocked the download (HTTP 403)."
+                continue
+            }
             val title = response.optJSONObject("videoDetails")?.optString("title").orEmpty().ifBlank { videoId }
             return PlayerInfo(title, streams, client)
         }
         throw IOException(lastReason)
     }
 
-    private fun postPlayer(client: Client, videoId: String): JSONObject {
+    /** Without a visitor id YouTube answers some clients with "Sign in to confirm you're not a bot". */
+    private fun fetchVisitorData(): String? {
+        val connection = (URL(VISITOR_URL).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 20_000
+            setRequestProperty("User-Agent", clients.first().userAgent)
+        }
+        try {
+            if (connection.responseCode !in 200..299) return null
+            val text = connection.inputStream.bufferedReader().use { it.readText() }
+            return visitorPattern.find(text)?.groupValues?.get(1)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun canReadDeep(stream: Stream, client: Client): Boolean {
+        if (stream.contentLength < 2L) return true
+        val start = stream.contentLength / 2
+        val connection = (URL(stream.url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 20_000
+            setRequestProperty("User-Agent", client.userAgent)
+            setRequestProperty("Range", "bytes=$start-${start + 1023}")
+        }
+        return try {
+            connection.responseCode in 200..299
+        } catch (_: IOException) {
+            true // Network hiccup, not a refusal; let the download's retries handle it.
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun postPlayer(client: Client, videoId: String, visitorData: String?): JSONObject {
         val clientJson = JSONObject()
             .put("clientName", client.name)
             .put("clientVersion", client.version)
             .put("hl", "en")
+        if (visitorData != null) clientJson.put("visitorData", visitorData)
         client.extra.forEach { (key, value) -> clientJson.put(key, value) }
         val body = JSONObject()
             .put("context", JSONObject().put("client", clientJson))
@@ -152,6 +196,8 @@ class YouTubeDownloader(private val outputDir: File) {
             setRequestProperty("User-Agent", client.userAgent)
             setRequestProperty("X-YouTube-Client-Name", client.id)
             setRequestProperty("X-YouTube-Client-Version", client.version)
+            setRequestProperty("Origin", "https://www.youtube.com")
+            if (visitorData != null) setRequestProperty("X-Goog-Visitor-Id", visitorData)
         }
         try {
             connection.outputStream.use { it.write(body.toByteArray()) }
@@ -277,6 +323,8 @@ class YouTubeDownloader(private val outputDir: File) {
 
     companion object {
         private const val PLAYER_URL = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+        private const val VISITOR_URL = "https://www.youtube.com/sw.js_data"
+        private val visitorPattern = Regex("\"(Cg[A-Za-z0-9_%-]{8,})\"")
         private const val CHUNK = 8L * 1024 * 1024
         private val idPattern = Regex("^[A-Za-z0-9_-]{11}$")
         private val linkPatterns = listOf(
@@ -284,7 +332,20 @@ class YouTubeDownloader(private val outputDir: File) {
             Regex("""youtu\.be/([A-Za-z0-9_-]{11})"""),
         )
 
+        // Mirrors yt-dlp's default: VISIONOS still serves full streams without a PO token.
         private val clients = listOf(
+            Client(
+                name = "VISIONOS",
+                id = "101",
+                version = "1.02",
+                userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+                extra = mapOf(
+                    "deviceMake" to "Apple",
+                    "deviceModel" to "RealityDevice17,1",
+                    "osName" to "visionOS",
+                    "osVersion" to "26.5.23O471",
+                ),
+            ),
             Client(
                 name = "IOS",
                 id = "5",
@@ -329,6 +390,12 @@ class YouTubeDownloader(private val outputDir: File) {
                 .replace(Regex("\\s+"), "_")
                 .take(120)
                 .ifBlank { "video" }
+
+        /** xtags is a base64 protobuf; dynamic-range-compressed audio carries a "drc" tag. */
+        private fun isDrcXtags(xtags: String): Boolean =
+            xtags.isNotBlank() && runCatching {
+                String(java.util.Base64.getUrlDecoder().decode(xtags.trimEnd('=')), Charsets.ISO_8859_1).contains("drc")
+            }.getOrDefault(false)
 
         private fun percent(value: Float): String = "${(value * 100).toInt().coerceIn(0, 100)}%"
     }
